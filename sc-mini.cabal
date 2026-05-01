@@ -19,6 +19,7 @@ library
       Supercompiler
       TreeInterpreter
       Bedrock
+      LLMSupercompiler
   hs-source-dirs:
       src
   build-depends:

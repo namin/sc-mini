@@ -1,4 +1,4 @@
-module DataIO (expr, prog, printTree) where
+module DataIO (expr, prog, printTree, showSLL) where
 
 import Data
 import DataUtil
@@ -47,12 +47,23 @@ readExpr :: ReadP Expr
 readExpr = readS_to_P readsExpr
 
 readsExpr :: ReadS Expr
-readsExpr i = catMaybes [merge n (readArgs s)  s | (n, s) <- lex i] where
+readsExpr i = readLet i ++ catMaybes [merge n (readArgs s)  s | (n, s) <- lex i] where
   merge n@('g':_) [(args, s1)] _ = Just (GCall n args, s1)
   merge n@('f':_) [(args, s1)] _ = Just (FCall n args, s1)
   merge n@(x:_) [(args, s1)] _ | isUpper x = Just (Ctr n args, s1)
-  merge n@(x:_) [] s | isLower x = Just (Var n, s)
+  merge n@(x:_) [] s | isLower x, n /= "let", n /= "in" = Just (Var n, s)
   merge _ _ _ = Nothing
+
+readLet :: ReadS Expr
+readLet i =
+  [ (Let (v, e1) e2, s5)
+  | ("let", s1) <- lex i
+  , (v, s2) <- lex s1
+  , ("=", s3) <- lex s2
+  , (e1, s4) <- readsExpr s3
+  , ("in", s4') <- lex s4
+  , (e2, s5) <- readsExpr s4'
+  ]
 
 readArgs :: ReadS [Expr]
 readArgs = readP_to_S $ between (char '(') (char ')') (sepBy readExpr (char ','))
@@ -141,3 +152,18 @@ instance Show a => Show (Step a) where
   show Stop = "!"
   show (Decompose ds) = show ds
   show (Fold e _) = "↑" ++ (show e)
+
+showSLL :: Expr -> String
+showSLL (Var n) = n
+showSLL (Ctr n es) = n ++ "(" ++ intercalate ", " (map showSLL es) ++ ")"
+showSLL (FCall n es) = n ++ "(" ++ intercalate ", " (map showSLL es) ++ ")"
+showSLL (GCall n es) = n ++ "(" ++ intercalate ", " (map showSLL es) ++ ")"
+showSLL (Let (v, e1) e2) = "let " ++ v ++ " = " ++ showSLL e1 ++ " in " ++ showSLL e2
+
+showSLLProgram :: Program -> String
+showSLLProgram (Program fs gs) = intercalate "\n" $ map showFDef fs ++ map showGDef gs
+  where
+    showFDef (FDef n args body) = n ++ "(" ++ intercalate ", " args ++ ") = " ++ showSLL body ++ ";"
+    showGDef (GDef n (Pat cn cvs) args body) =
+      n ++ "(" ++ cn ++ "(" ++ intercalate ", " cvs ++ ")" ++
+      concatMap (", " ++) args ++ ") = " ++ showSLL body ++ ";"
