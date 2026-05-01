@@ -15,6 +15,7 @@ import Data.Maybe
 import Generator
 import Prototype
 import Deforester
+import Types
 
 prog1 :: Program
 prog1 = [prog|
@@ -30,6 +31,22 @@ prog1 = [prog|
   gAdd1(Z(), y) = y;
   gAdd1(S(x), y) = gAdd1(x, S(y));
 |]
+
+prog1Types :: TypeEnv
+prog1Types = TypeEnv
+  { typeDefs =
+      [ DataDef "Nat"  [CtrDef "Z" [], CtrDef "S" [TyCon "Nat"]]
+      , DataDef "Bool" [CtrDef "True" [], CtrDef "False" []]
+      ]
+  , funSigs =
+      [ ("gAdd",  ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      , ("gMult", ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      , ("fSqr",  ([TyCon "Nat"], TyCon "Nat"))
+      , ("gEven", ([TyCon "Nat"], TyCon "Bool"))
+      , ("gOdd",  ([TyCon "Nat"], TyCon "Bool"))
+      , ("gAdd1", ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      ]
+  }
 
 prog2 :: Program
 prog2 = [prog|
@@ -47,6 +64,27 @@ prog2 = [prog|
   gN(Nil(), op) = False();
   gN(Cons(s, ss), op) = gM(op, ss, op, ss);
 |]
+
+-- gIf is monomorphic-per-program; in prog2 it's used at Bool only
+-- (both branches return Bool from gM/gN), so we type it that way.
+prog2Types :: TypeEnv
+prog2Types = TypeEnv
+  { typeDefs =
+      [ DataDef "Sym"  [CtrDef "A" [], CtrDef "B" []]
+      , DataDef "Bool" [CtrDef "True" [], CtrDef "False" []]
+      , DataDef "LSym" [CtrDef "Nil" [], CtrDef "Cons" [TyCon "Sym", TyCon "LSym"]]
+      ]
+  , funSigs =
+      [ ("gEqSymb", ([TyCon "Sym", TyCon "Sym"], TyCon "Bool"))
+      , ("gEqA",    ([TyCon "Sym"], TyCon "Bool"))
+      , ("gEqB",    ([TyCon "Sym"], TyCon "Bool"))
+      , ("gIf",     ([TyCon "Bool", TyCon "Bool", TyCon "Bool"], TyCon "Bool"))
+      , ("fMatch",  ([TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
+      , ("gM",      ([TyCon "LSym", TyCon "LSym", TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
+      , ("gX",      ([TyCon "LSym", TyCon "Sym", TyCon "LSym", TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
+      , ("gN",      ([TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
+      ]
+  }
 
 -- more clear KMP test
 prog2a :: Program
@@ -66,6 +104,9 @@ prog2a = [prog|
   gN(Cons(s, ss), op) = gM(op, ss, op, ss);
 |]
 
+prog2aTypes :: TypeEnv
+prog2aTypes = prog2Types
+
 prog3 :: Program
 prog3 = [prog|
   gAdd(Z(), y) = y;
@@ -83,6 +124,23 @@ prog3 = [prog|
   gEqS(Z(), x) = False();
   gEqS(S(y), x) = gEq(x, y);
 |]
+
+prog3Types :: TypeEnv
+prog3Types = TypeEnv
+  { typeDefs =
+      [ DataDef "Nat"  [CtrDef "Z" [], CtrDef "S" [TyCon "Nat"]]
+      , DataDef "Bool" [CtrDef "True" [], CtrDef "False" []]
+      ]
+  , funSigs =
+      [ ("gAdd",    ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      , ("gDouble", ([TyCon "Nat"], TyCon "Nat"))
+      , ("gHalf",   ([TyCon "Nat"], TyCon "Nat"))
+      , ("gHalf1",  ([TyCon "Nat"], TyCon "Nat"))
+      , ("gEq",     ([TyCon "Nat", TyCon "Nat"], TyCon "Bool"))
+      , ("gEqZ",    ([TyCon "Nat"], TyCon "Bool"))
+      , ("gEqS",    ([TyCon "Nat", TyCon "Nat"], TyCon "Bool"))
+      ]
+  }
 
 prog4 :: Program
 prog4 = [prog|
