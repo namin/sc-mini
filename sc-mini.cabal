@@ -18,9 +18,21 @@ library
       Prototype
       Supercompiler
       TreeInterpreter
+      Bedrock
   hs-source-dirs:
       src
   build-depends:
       base >= 4.13 && < 5,
       template-haskell,
+      aeson,
+      bytestring,
+      http-client,
+      http-client-tls,
+      text,
+      time,
+      cryptohash-sha256,
+      base16-bytestring,
+      case-insensitive,
+      http-types,
+      directory,
   default-language: Haskell2010
