@@ -23,6 +23,7 @@ library
       Types
       LeanEmbed
       LeanCheck
+      LeanProver
   hs-source-dirs:
       src
   build-depends:
