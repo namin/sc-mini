@@ -2,7 +2,8 @@ module DataUtil(
   isValue,isCall,isVar,size,
   fDef, gDef, gDefs,
   (//), renaming, vnames,nameSupply,
-  nodeLabel,isRepeated,unused
+  nodeLabel,isRepeated,unused,
+  homeEmbed, msg
   ) where
 
 import Data
@@ -76,6 +77,57 @@ renaming' ((FCall n1 args1), (FCall n2 args2)) | n1 == n2 = concat $ map renamin
 renaming' ((GCall n1 args1), (GCall n2 args2)) | n1 == n2 = concat $ map renaming' $ zip args1 args2
 renaming' (Let (v, e1) e2, Let (v', e1') e2') = renaming' (e1, e1') ++ renaming' (e2, e2' // [(v, Var v')])
 renaming' _  = [Nothing]
+
+-- Homeomorphic embedding: e1 ◁ e2 means e1 is structurally simpler than e2.
+-- Used as the whistle: if an ancestor embeds in the current term, the term is growing.
+homeEmbed :: Expr -> Expr -> Bool
+homeEmbed (Var _) _ = True
+homeEmbed e1 e2 | couple e1 e2 = True
+homeEmbed e1 e2 = dive e1 e2
+
+couple :: Expr -> Expr -> Bool
+couple (Ctr n1 args1) (Ctr n2 args2) =
+  n1 == n2 && length args1 == length args2 && and (zipWith homeEmbed args1 args2)
+couple (FCall n1 args1) (FCall n2 args2) =
+  n1 == n2 && length args1 == length args2 && and (zipWith homeEmbed args1 args2)
+couple (GCall n1 args1) (GCall n2 args2) =
+  n1 == n2 && length args1 == length args2 && and (zipWith homeEmbed args1 args2)
+couple _ _ = False
+
+dive :: Expr -> Expr -> Bool
+dive e1 (Ctr _ args)   = any (homeEmbed e1) args
+dive e1 (FCall _ args) = any (homeEmbed e1) args
+dive e1 (GCall _ args) = any (homeEmbed e1) args
+dive e1 (Let (_, a) b) = homeEmbed e1 a || homeEmbed e1 b
+dive _ _ = False
+
+-- Most-specific generalization of two expressions.
+-- Returns (generalized_expr, subst_for_e1, subst_for_e2).
+-- The generalized expr with subst1 applied gives e1, with subst2 gives e2.
+msg :: NameSupply -> Expr -> Expr -> (Expr, Subst, Subst)
+msg ns (Ctr c1 args1) (Ctr c2 args2)
+  | c1 == c2, length args1 == length args2 =
+      let (args', s1s, s2s) = msgList ns args1 args2
+      in (Ctr c1 args', concat s1s, concat s2s)
+msg ns (FCall f1 args1) (FCall f2 args2)
+  | f1 == f2, length args1 == length args2 =
+      let (args', s1s, s2s) = msgList ns args1 args2
+      in (FCall f1 args', concat s1s, concat s2s)
+msg ns (GCall g1 args1) (GCall g2 args2)
+  | g1 == g2, length args1 == length args2 =
+      let (args', s1s, s2s) = msgList ns args1 args2
+      in (GCall g1 args', concat s1s, concat s2s)
+msg ns (Var v1) (Var v2) | v1 == v2 = (Var v1, [], [])
+msg (n:_) e1 e2 = (Var n, [(n, e1)], [(n, e2)])
+
+msgList :: NameSupply -> [Expr] -> [Expr] -> ([Expr], [Subst], [Subst])
+msgList ns [] [] = ([], [], [])
+msgList ns (a:as) (b:bs) =
+  let (g, s1, s2) = msg ns a b
+      usedNames = map fst s1
+      ns' = filter (`notElem` usedNames) ns
+      (gs, s1s, s2s) = msgList ns' as bs
+  in (g:gs, s1:s1s, s2:s2s)
 
 size :: Expr -> Integer
 size (Var _) = 1
