@@ -21,6 +21,7 @@ library
       Bedrock
       LLMSupercompiler
       Types
+      LeanEmbed
   hs-source-dirs:
       src
   build-depends:
@@ -37,4 +38,5 @@ library
       case-insensitive,
       http-types,
       directory,
+      containers,
   default-language: Haskell2010
