@@ -1,6 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module LLMSupercompiler (supercompileIO, supercompilePure) where
+module LLMSupercompiler
+  ( supercompileIO
+  , supercompileIOWithTypes
+  , supercompilePure
+  ) where
 
 import Data
 import DataUtil
@@ -11,8 +15,12 @@ import Generator
 import Deforester (simplify)
 import Supercompiler (addPropagation)
 import Bedrock
+import Types (TypeEnv)
+import LeanEmbed (embedConjecture)
+import LeanCheck (LeanProject, projDir, Verdict(..), setupProject, verify, teardownProject)
+import LeanProver (tryAuto)
 
-import Data.List (intercalate)
+import Data.List (intercalate, isPrefixOf)
 import Data.IORef
 import Control.Exception (try, SomeException)
 import System.IO (hPutStrLn, stderr)
@@ -20,11 +28,33 @@ import System.IO (hPutStrLn, stderr)
 maxLLMCalls :: Int
 maxLLMCalls = 10
 
+-- A Whistle decides what to do when the homeomorphic-embedding check
+-- fires: given (ancestor, freshName, current, nameSupply), produce the
+-- expression the supercompiler should drive next. Returns IO so it can
+-- consult the LLM and/or Lean.
+type Whistle = Conf -> Name -> Conf -> NameSupply -> IO Conf
+
+-- Existing entry point: LLM proposes generalizations, no verification.
 supercompileIO :: Task -> IO Task
 supercompileIO (e, p) = do
   counter <- newIORef (0 :: Int)
-  tree <- bftIO counter (addPropagation $ driveMachine p) p nameSupply [] e
+  let w = mkUnverifiedWhistle counter p
+  tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
   return $ residuate $ simplify $ foldTree tree
+
+-- New entry point: LLM proposes generalizations and either auto-prove or
+-- LLM-supplied Lean proof must verify before we accept them. On any
+-- verification failure path we fall back to msgToLet.
+supercompileIOWithTypes :: TypeEnv -> Task -> IO Task
+supercompileIOWithTypes env (e, p) = do
+  counter <- newIORef (0 :: Int)
+  proj <- setupProject env p
+  hPutStrLn stderr $ "[lean] proofs dir: " ++ projDir proj
+  let w = mkVerifiedWhistle counter env p proj
+  tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
+  let result = residuate $ simplify $ foldTree tree
+  teardownProject proj
+  return result
 
 supercompilePure :: Task -> Task
 supercompilePure (e, p) =
@@ -42,35 +72,78 @@ bftPure d ns hist t = case d ns t of
   Variants cs  -> Node t $ Variants [(c, bftPure d (unused c ns) hist' e) | (c, e) <- cs]
   where hist' = if isCall t then t : hist else hist
 
--- IO version with LLM generalization
-bftIO :: IORef Int -> Machine Conf -> Program -> NameSupply -> [Conf] -> Conf -> IO (Tree Conf)
-bftIO counter d p (n:ns) hist e
+-- IO version with HE whistle. The Whistle parameter decides what
+-- generalized expression to use when HE fires; this layer is purely
+-- structural and doesn't know about LLM or Lean.
+bftIO :: Whistle -> Machine Conf -> NameSupply -> [Conf] -> Conf -> IO (Tree Conf)
+bftIO w d (n:ns) hist e
   | whistleCandidate e, Just anc <- findEmbedding hist e = do
-      calls <- readIORef counter
-      if calls >= maxLLMCalls
-        then do
-          let hist' = filter (/= anc) hist
-          hPutStrLn stderr "  [whistle] budget exhausted, using msg"
-          bftIO counter d p ns hist' (msgToLet (n:ns) e anc)
-        else do
-          let hist' = filter (/= anc) hist
-          hPutStrLn stderr $ "  [whistle] HE detected"
-          hPutStrLn stderr $ "    ancestor:  " ++ showSLL anc
-          hPutStrLn stderr $ "    current:   " ++ showSLL e
-          gen <- llmGeneralize counter p anc n e ns
-          bftIO counter d p ns hist' gen
-bftIO counter d p ns hist t = case d ns t of
+      let hist' = filter (/= anc) hist
+      hPutStrLn stderr "  [whistle] HE detected"
+      hPutStrLn stderr $ "    ancestor:  " ++ showSLL anc
+      hPutStrLn stderr $ "    current:   " ++ showSLL e
+      gen <- w anc n e ns
+      bftIO w d ns hist' gen
+bftIO w d ns hist t = case d ns t of
   Decompose ds -> do
-    cs <- mapM (bftIO counter d p ns hist') ds
+    cs <- mapM (bftIO w d ns hist') ds
     return $ Node t $ Decompose cs
   Transient e -> do
-    c <- bftIO counter d p ns hist' e
+    c <- bftIO w d ns hist' e
     return $ Node t $ Transient c
   Stop -> return $ Node t Stop
   Variants cs -> do
-    cs' <- sequence [(,) c <$> bftIO counter d p (unused c ns) hist' e | (c, e) <- cs]
+    cs' <- sequence [(,) c <$> bftIO w d (unused c ns) hist' e | (c, e) <- cs]
     return $ Node t $ Variants cs'
   where hist' = if isCall t then t : hist else hist
+
+-- Whistle for the unverified path: ask the LLM, accept whatever it says
+-- (with classical fallback on parse/network failure or budget exhaustion).
+mkUnverifiedWhistle :: IORef Int -> Program -> Whistle
+mkUnverifiedWhistle counter prog anc n e _ = do
+  calls <- readIORef counter
+  if calls >= maxLLMCalls
+    then do
+      hPutStrLn stderr "  [whistle] budget exhausted, using classical"
+      return (classicalGeneralize n e)
+    else llmGeneralize counter prog anc n e
+
+-- Whistle for the verified path: ask the LLM, then auto-prove; if that
+-- fails, ask the LLM for a proof body and verify that; on any persistent
+-- failure (budget, proof, or absent response), fall back to classical
+-- generalization, which is what the pure path uses and is known to
+-- converge structurally.
+mkVerifiedWhistle :: IORef Int -> TypeEnv -> Program -> LeanProject -> Whistle
+mkVerifiedWhistle counter env prog proj anc n e _ = do
+  calls <- readIORef counter
+  if calls >= maxLLMCalls
+    then do
+      hPutStrLn stderr "  [whistle] budget exhausted, using classical"
+      return (classicalGeneralize n e)
+    else do
+      gen <- llmGeneralize counter prog anc n e
+      v <- tryAuto env prog proj e gen
+      case v of
+        Ok -> do
+          hPutStrLn stderr "  [verify] auto-prove Ok"
+          return gen
+        Failed s -> do
+          hPutStrLn stderr "  [verify] auto-prove Failed; asking LLM for proof"
+          mProof <- llmProveBody counter env prog e gen s
+          case mProof of
+            Nothing -> do
+              hPutStrLn stderr "  [verify] no proof available; falling back to classical"
+              return (classicalGeneralize n e)
+            Just proof -> do
+              v2 <- verify proj (embedConjecture env prog e gen proof)
+              case v2 of
+                Ok -> do
+                  hPutStrLn stderr "  [verify] LLM proof Ok"
+                  return gen
+                Failed s2 -> do
+                  hPutStrLn stderr $ "  [verify] LLM proof Failed: "
+                                     ++ take 200 s2
+                  return (classicalGeneralize n e)
 
 whistleCandidate :: Expr -> Bool
 whistleCandidate (FCall _ args) = not (all isVar args)
@@ -84,18 +157,20 @@ findEmbedding (a:as) e
   | homeEmbed a e = Just a
   | otherwise = findEmbedding as e
 
--- Ask the LLM to generalize given the ancestor/descendant pair
-llmGeneralize :: IORef Int -> Program -> Conf -> Name -> Conf -> NameSupply -> IO Conf
-llmGeneralize counter prog ancestor freshName expr ns = do
+-- Ask the LLM to generalize given the ancestor/descendant pair. On any
+-- failure (network, parse, malformed reply) we fall through to classical
+-- generalization, the same one the pure path uses.
+llmGeneralize :: IORef Int -> Program -> Conf -> Name -> Conf -> IO Conf
+llmGeneralize counter prog ancestor freshName expr = do
   modifyIORef' counter (+1)
   calls <- readIORef counter
   let prompt = buildPrompt prog ancestor expr freshName
-      fallback = msgToLet ns expr ancestor
+      fallback = classicalGeneralize freshName expr
   hPutStrLn stderr $ "  [llm] call #" ++ show calls
   result <- try (chat prompt) :: IO (Either SomeException String)
   case result of
     Left err -> do
-      hPutStrLn stderr $ "  [llm] error: " ++ show err ++ ", falling back to msg"
+      hPutStrLn stderr $ "  [llm] error: " ++ show err ++ ", falling back to classical"
       return fallback
     Right response -> do
       hPutStrLn stderr $ "  [llm] response: " ++ take 200 response
@@ -104,8 +179,74 @@ llmGeneralize counter prog ancestor freshName expr ns = do
           hPutStrLn stderr $ "  [llm] parsed: " ++ showSLL parsed
           return parsed
         Nothing -> do
-          hPutStrLn stderr "  [llm] parse failed, falling back to msg"
+          hPutStrLn stderr "  [llm] parse failed, falling back to classical"
           return fallback
+
+-- Ask the LLM for a Lean proof body. Counts against the same budget as
+-- generalization calls. Returns the parsed `by ...` block or Nothing.
+llmProveBody :: IORef Int -> TypeEnv -> Program -> Conf -> Conf -> String -> IO (Maybe String)
+llmProveBody counter env prog e gen autoFailure = do
+  modifyIORef' counter (+1)
+  calls <- readIORef counter
+  let prompt = buildProofPrompt env prog e gen autoFailure
+  hPutStrLn stderr $ "  [llm-proof] call #" ++ show calls
+  result <- try (chat prompt) :: IO (Either SomeException String)
+  case result of
+    Left err -> do
+      hPutStrLn stderr $ "  [llm-proof] error: " ++ show err
+      return Nothing
+    Right response -> do
+      let proof = extractProofBody response
+      hPutStrLn stderr $ "  [llm-proof] body: " ++ take 200 proof
+      return (Just proof)
+
+-- Extract the `by …` block from the LLM response. Tolerates markdown
+-- fencing and a brief preamble; drops any trailing prose or fences.
+-- If no `by ` token is found, hands the cleaned text to Lean as-is and
+-- lets the failure trigger the msg fallback.
+extractProofBody :: String -> String
+extractProofBody resp =
+  stopAtFence (dropToBy (stripMarkdown (strip resp)))
+  where
+    dropToBy s
+      | "by " `isPrefixOf` s = s
+      | "by\n" `isPrefixOf` s = s
+      | null s = s
+      | otherwise = dropToBy (drop 1 s)
+
+    stopAtFence ('`':'`':'`':_) = ""
+    stopAtFence (c:rest)        = c : stopAtFence rest
+    stopAtFence []              = []
+
+buildProofPrompt :: TypeEnv -> Program -> Conf -> Conf -> String -> String
+buildProofPrompt env prog e gen autoFailure = unlines
+  [ "You are a Lean 4 prover. The supercompiler proposed a generalization"
+  , "of the form  e ≡ e'  but the auto-prove step (simp_all with the"
+  , "program's equation lemmas) could not discharge it."
+  , ""
+  , "We need a Lean 4 tactic block that proves this theorem:"
+  , ""
+  , embedConjecture env prog e gen "<YOUR PROOF HERE>"
+  , ""
+  , "The function names " ++ funList ++ " are the program's definitions"
+  , "and their equation lemmas are available to simp."
+  , ""
+  , "Auto-prove output (for context — these are the errors we must avoid):"
+  , autoFailure
+  , ""
+  , "Reply with ONLY the proof body — a single Lean 4 expression starting"
+  , "with `by `. Use only core Lean 4 tactics (no Mathlib). Common"
+  , "ingredients: intros, simp_all [<defs>], induction <var>, cases <var>,"
+  , "<;> (sequence-all), rfl."
+  , ""
+  , "Example: by intros; induction x <;> simp_all [gAdd, gMult]"
+  ]
+  where
+    funList = intercalate ", " (proverFunNames prog)
+
+proverFunNames :: Program -> [Name]
+proverFunNames (Program fs gs) =
+  [n | FDef n _ _ <- fs] ++ [n | GDef n _ _ _ <- gs]
 
 buildPrompt :: Program -> Conf -> Conf -> Name -> String
 buildPrompt prog ancestor expr freshName =
