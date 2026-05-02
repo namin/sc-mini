@@ -220,21 +220,30 @@ two of the four benchmarks, and Lean verifies their proofs.
 
 After all five mechanisms (chaining, retry, rejects tracking,
 conditional guidance, smarter rewriter), the system's behavior on the
-five-benchmark suite is:
+seven-benchmark suite is:
 
-| Benchmark        | Classical    | LLM (typical run)         |
-|------------------|--------------|---------------------------|
-| even-square      | 328 fns / 13 steps | **4 fns / 13 steps** (sometimes 22 fns — see variance below) |
-| add-assoc        | 4 / 22       | 4 / 22 (matches)          |
-| half-of-double   | 2 / 13       | **0 / 0** (beats classical) |
-| kmp-aa           | 9 / —        | 37 / — (out of scope)    |
-| add-commute      | 207 / 25     | 14 / 67 (matches original) |
+| Benchmark            | Classical          | LLM (typical run)              |
+|----------------------|--------------------|--------------------------------|
+| even-square          | 328 fns / 13 steps | **4 fns / 13 steps** (variance — see below) |
+| add-assoc            | 4 / 22             | 4 / 22 (matches)               |
+| half-of-double       | 2 / 13             | **0 / 0** (beats classical)    |
+| kmp-aa               | 9 / —              | 37 / — (out of scope)          |
+| add-commute          | 207 / 25           | 14 / 67 (matches original)     |
+| reverse-involution   | 48 / 42            | **0 / 0** (beats classical)    |
+| length-distributes   | 4 / 22             | 10 / 33 (regresses)            |
 
 The cleanest wins:
 
 - **half-of-double**: LLM chains `gHalf(gDouble(n)) = n` and
   `gEq(n, n) = True()` to reduce the input to a constant. Zero
   residual functions, zero step count.
+- **reverse-involution**: LLM proposes
+  `gReverse(gReverse(xs)) = xs` on the first iteration, Lean verifies
+  the inductive proof, the rewriter applies it, the input collapses
+  to the bare variable `xs`. Zero functions, zero steps regardless
+  of input list length. Crucially this isn't Peano arithmetic — it's
+  a list functor identity, demonstrating the approach generalizes
+  beyond the original numeric demos.
 - **even-square** (when it works): LLM proposes
   `gEven(fSqr(x)) = gEven(x)` (or the more general
   `gEven(gMult(x, x)) = gEven(x)`, handled by the smarter rewriter),
@@ -242,7 +251,7 @@ The cleanest wins:
   `gEven(x)` to 4 functions. Same speed as classical, 82x smaller
   residual.
 
-The structural failures:
+The informative failures:
 
 - **kmp-aa**: input has only one call subexpression (`fMatch` itself).
   No useful semantic lemma exists at the candidate level. Out of
@@ -254,6 +263,19 @@ The structural failures:
   cleanly; commutativity itself doesn't — the LLM's Lean proof
   attempts use invalid tactics or fail in ways even a retry doesn't
   catch.
+- **length-distributes**: LLM proposes the homomorphism
+  `gLength(gAppend(xs, ys)) = gAdd(gLength(xs), gLength(ys))`. The
+  proof verifies. The rewriter applies it. But the residual gets
+  *slightly larger and slower*: LHS has 2 function calls, RHS has 3,
+  and the asymptotic cost of computing both sides is the same (both
+  O(m+n) for lists of lengths m and n). The lemma is true and the
+  rewriter applies it correctly — but it's a *refactoring*, not an
+  optimization. The system has no way to distinguish the two and
+  applies any verified lemma. This surfaces a previously-unstated
+  assumption: distillation only helps when the lemma's RHS is
+  *substantively cheaper* than the LHS, not just structurally
+  different. The prompt does say "RHS structurally simpler" but the
+  LLM overrode that with the canonical homomorphism equation.
 
 ## The variance floor
 
@@ -300,22 +322,32 @@ The remaining variance and the `add-commute` holdout point at
 LLM-side proof unreliability, not at the architecture.
 
 **Not yet:**
-1. **Multi-sample lemma proposals**: have the LLM emit N candidate
+1. **Reject lemmas that don't reduce work**: pre-filter LLM proposals
+   before sending to Lean — if the RHS has the same or more function
+   applications than the LHS, skip the verification call. Surfaced
+   by `length-distributes`. The LLM's "structurally simpler" prior
+   is loose enough that it'll propose true-but-non-optimizing
+   equations like the length-of-append homomorphism. A simple syntactic
+   check at our side is more reliable than a prompt instruction.
+   (Could be too conservative for cases like `add-assoc` where the
+   call counts are equal but the rewrite still helps the supercompiler
+   fold; need to think about the right metric.)
+2. **Multi-sample lemma proposals**: have the LLM emit N candidate
    proofs per turn and verify each. Damps variance from
    non-deterministic proof writing (the dominant remaining failure
    mode). Cost-multiplier on Bedrock spend; would likely close
    `add-commute` and stabilize `even-square`.
-2. **Try every lemma in the chain against the input on each
+3. **Try every lemma in the chain against the input on each
    iteration**: currently we only try the most recently verified
    lemma against the current expression. A re-application pass would
    pick up cases where an earlier off-target lemma becomes
    on-target after the input shape changes.
-3. **Oscillation detection**: detect when a lemma rewrites in one
+4. **Oscillation detection**: detect when a lemma rewrites in one
    direction and a subsequent lemma reverses it. Doesn't unblock
    benchmarks but prevents wasted Bedrock calls.
-4. **Persistent lemma library**: cache verified lemmas across
+5. **Persistent lemma library**: cache verified lemmas across
    supercompile runs so each program "learns" over time.
-5. **Auto-prove tactic widening**: nothing has tripped the
+6. **Auto-prove tactic widening**: nothing has tripped the
    LLM-as-prover path with an Ok verdict yet on the existing
    benchmarks. Real induction-needing conjectures would benefit
    from a tactic like

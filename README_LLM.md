@@ -176,8 +176,6 @@ Sample output (typical run; outcomes have run-to-run variance — see
 ```
 ==> even-square
     sizes: orig=11  classical=328  llm=4
-    input    |  orig  |  class |   llm  | cls/orig |  llm/orig | llm/cls
-    ---------+--------+--------+--------+----------+-----------+--------
     12       |    315 |     13 |     13 |    0.04  |    0.04   |   1.00
 
 ==> add-assoc
@@ -195,14 +193,29 @@ Sample output (typical run; outcomes have run-to-run variance — see
 ==> add-commute
     sizes: orig=14  classical=207  llm=14
     10/11    |     67 |     25 |     67 |    0.37  |    1.00   |   2.68
+
+==> reverse-involution
+    sizes: orig=10  classical=48  llm=0
+    len10    |    132 |     42 |      0 |    0.32  |    0.00   |   0.00
+
+==> length-distributes
+    sizes: orig=10  classical=4  llm=10
+    10+10    |     32 |     22 |     33 |    0.69  |    1.03   |   1.50
 ```
 
 Where the LLM path lands:
 
-- **half-of-double** is the headline win: distillation chains
+- **half-of-double** is a headline win: distillation chains
   `gHalf(gDouble(n)) = n` and `gEq(n, n) = True()` to reduce the input
   to a constant. **0 functions, 0 steps** — strictly smaller and
   faster than classical.
+- **reverse-involution** is the second headline win, on lists this
+  time: LLM proposes `gReverse(gReverse(xs)) = xs`, Lean verifies the
+  inductive proof, the rewriter applies it, the input collapses to
+  `xs`. Zero functions, zero steps regardless of list length —
+  classical needs 42 steps for a 10-element list, LLM needs 0. Notable
+  because it's *not* Peano arithmetic — the approach generalizes to
+  list functor identities.
 - **even-square** is the headline *size* win when it lands: same
   speed as classical (13 steps at n=12) but the residual is 4
   functions vs. classical's 328. Two-orders-of-magnitude smaller
@@ -214,12 +227,25 @@ Where the LLM path lands:
 - **kmp-aa** is structurally out of scope — the input has only one
   call subexpression (`fMatch(...)`); no useful semantic lemma exists
   at the candidate level.
-- **add-commute** is the informative failure: the LLM correctly
+- **add-commute** is an informative failure: the LLM correctly
   identifies the chain it needs (helpers `gAdd(x, Z) = x` and
   `gAdd(x, S(y)) = S(gAdd(x, y))`, then commutativity). Helpers
   verify; commutativity itself doesn't, because the LLM's Lean
   proof attempts use invalid tactics that retry doesn't always
   salvage.
+- **length-distributes** is a *different* informative failure: the
+  LLM proposes the homomorphism
+  `gLength(gAppend(xs, ys)) = gAdd(gLength(xs), gLength(ys))`, Lean
+  verifies, the rewriter applies. But the residual ends up slightly
+  *bigger and slower* (10 fns / 33 steps vs. classical's 4 fns / 22
+  steps). The lemma is true and the rewrite is mechanical, but the
+  RHS has *more* function calls than the LHS, so this is a
+  *refactoring*, not an optimization. Distillation can't tell the
+  difference and applies any verified lemma. The prompt does ask for
+  "structurally simpler RHS" but the LLM overrode it with the
+  canonical homomorphism. A pre-filter at our side ("reject if RHS
+  is no smaller than LHS") would catch this without burning a Lean
+  verification call.
 
 ### Variance floor
 
@@ -347,12 +373,15 @@ chain to verify on its second attempt.
 
 ## Benchmarks
 
-| Name             | Input                                                 | Program  | Notes |
-|------------------|-------------------------------------------------------|----------|-------|
-| `even-square`    | `gEven(fSqr(x))`                                      | prog1    | The headline benchmark from PLAN.md. |
-| `add-assoc`      | `gAdd(gAdd(x, y), z)`                                 | prog1    | Should drive into associativity-shaped residual. |
-| `half-of-double` | `gEq(gHalf(gDouble(n)), n)`                           | prog3    | Property is identically `True`; supercompiler erases the equality. |
-| `kmp-aa`         | `fMatch(Cons(A, Cons(A, Nil)), s)`                    | prog2    | KMP-style pattern matcher; uses `partial def` for `gM/gX/gN`. |
+| Name                 | Input                                                 | Program  | Notes |
+|----------------------|-------------------------------------------------------|----------|-------|
+| `even-square`        | `gEven(fSqr(x))`                                      | prog1    | The headline benchmark from PLAN.md. |
+| `add-assoc`          | `gAdd(gAdd(x, y), z)`                                 | prog1    | Drives into associativity-shaped residual. |
+| `half-of-double`     | `gEq(gHalf(gDouble(n)), n)`                           | prog3    | Property is identically `True`; supercompiler erases the equality. |
+| `kmp-aa`             | `fMatch(Cons(A, Cons(A, Nil)), s)`                    | prog2    | KMP-style pattern matcher; uses `partial def` for `gM/gX/gN`. |
+| `add-commute`        | `gEq(gAdd(x, y), gAdd(y, x))`                         | prog3    | Hard chain: needs gAdd-right-id and gAdd-succ-right as helpers, then commutativity. Helpers verify, commutativity doesn't. |
+| `reverse-involution` | `gReverse(gReverse(xs))`                              | prog5    | List-functor identity — collapses to `xs`. **List benchmark; demonstrates approach generalizes beyond Peano.** |
+| `length-distributes` | `gLength(gAppend(xs, ys))`                            | prog5    | Homomorphism. LLM proposes the canonical equation but its RHS isn't simpler than the LHS — the rewrite is a refactoring, not an optimization. |
 
 To add a benchmark, add an entry to `benchmarks` in `bench/Main.hs`.
 
