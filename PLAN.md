@@ -274,25 +274,35 @@ modest given the result.
 
 Where this approach hits its limit, on the current benchmarks:
 
-- `even-square` still doesn't unlock because the *right* sub-lemma
-  chain is intricate (parity-of-gMult needs parity-of-gAdd which
-  needs gAdd-with-Z, etc.) and the LLM tends to propose the *wrong*
-  big lemma (e.g. `gEven(gAdd(x,x)) = True`, which it then can't
-  prove because it's right but proving it requires the parity
-  reasoning we wanted in the first place). A few directions:
-  - More retry attempts (currently 1; bump to 2-3)
-  - Targeted prompting ("prove this specific sub-goal")
-  - A "decompose this" prompt that asks the LLM to enumerate sub-lemmas
-- `kmp-aa`: lemmas verify but don't pattern-match the input. The
-  targeted-prompting fix is the right one — narrow the LLM's
-  attention to subexpressions of the actual input.
+- `even-square` still doesn't unlock. We tried bumping the retry
+  budget from 1 to 3 and the benchmark numbers didn't change. The
+  retries *did* succeed — more lemmas got verified — but the LLM
+  proposes lemmas about gAdd-parity / gMult-properties whose LHS
+  doesn't pattern-match the actual input `gEven(fSqr(x))`. So they
+  verify, sit in the chain unused, and the input is never rewritten.
+  The bottleneck moved from "can the LLM prove it" to "is the lemma
+  even shaped to match the input."
+- `kmp-aa`: same shape of issue — lemmas verify but don't
+  pattern-match the input.
+
+The next-most-leverage work is therefore *not* further proof-search
+robustness; it's getting the LLM to propose lemmas whose LHS
+literally appears in (a subexpression of) the input. That's
+targeted prompting.
 
 **Not yet:**
 1. **Targeted prompting**: ask for a lemma about a specific
-   subexpression rather than "anything useful". Would help `kmp-aa`.
-2. **Bump proof-retry budget**: currently 1 retry per lemma. 2-3
-   would give the LLM more shots at fixing tricky proofs and might
-   unlock `even-square`'s sub-lemma chain.
+   subexpression rather than "anything useful". The empirical case
+   for this got stronger from the retry=3 experiment — extra retries
+   verified more lemmas but produced no new benchmark wins because
+   the lemmas were structurally off-target. Would address both
+   `kmp-aa` and likely `even-square`.
+2. **Smarter rewriter**: currently the rewriter only tries to apply
+   the latest verified lemma. A "try every lemma in the chain
+   against the input on each iteration" pass would let off-target
+   lemmas turn into matches once a different rewrite changes the
+   input shape. Lower leverage than (1) — wouldn't help when no
+   lemma matches at all — but free to add.
 3. **Oscillation detection**: detect when a lemma rewrites in one
    direction and a subsequent lemma reverses it. Doesn't unblock
    benchmarks but prevents wasted Bedrock calls.
