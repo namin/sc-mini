@@ -110,8 +110,12 @@ unconditionally so partial defs have a default-value fallback.
 
 ## Running the benchmarks
 
+Two harnesses, both make real Bedrock calls:
+
 ```
-stack build && stack exec llm-bench
+stack build
+stack exec llm-bench   # correctness/verification harness (4 benchmarks)
+stack exec llm-perf    # performance comparison: orig vs classical vs LLM
 ```
 
 Expected output (numbers vary because the LLM is non-deterministic):
@@ -155,6 +159,72 @@ residual is still valid.
 The full per-benchmark stderr trace is preserved at
 `bench/results/<name>.trace` so you can inspect ancestor/current pairs,
 LLM responses, and verification verdicts after the fact.
+
+## Performance comparison
+
+`stack exec llm-perf` runs the same four benchmarks but does the
+*counting* version: for each benchmark, it computes three programs —
+the original input, the classical-supercompile residual (size-bound
+whistle, `Supercompiler.supercompile`), and the LLM-supercompile
+residual (HE whistle, `supercompileIOWithTypes`) — then runs each
+through `intC` (the counting interpreter) on a series of concrete
+inputs and reports step counts and ratios.
+
+Sample output:
+
+```
+==> even-square
+    sizes: orig=11  classical=328  llm=22
+    input    |  orig  |  class |   llm  | cls/orig |  llm/orig | llm/cls
+    ---------+--------+--------+--------+----------+-----------+--------
+    0        |      3 |      1 |      1 |    0.33  |    0.33   |   1.00
+    12       |    315 |     13 |    314 |    0.04  |    1.00   |  24.15
+
+==> add-assoc
+    sizes: orig=11  classical=4  llm=8
+    10       |     32 |     22 |     32 |    0.69  |    1.00   |   1.45
+
+==> half-of-double
+    sizes: orig=14  classical=2  llm=14
+    12       |     64 |     13 |     64 |    0.20  |    1.00   |   4.92
+
+==> kmp-aa
+    sizes: orig=15  classical=9  llm=37
+    ABABAA   |     46 |     15 |     39 |    0.33  |    0.85   |   2.60
+```
+
+**The harness is also a correctness check**: it verifies all three
+variants produce the same value on every test input. Mismatches would
+show as `*** VALUE MISMATCH ***` next to the row.
+
+### What the numbers say
+
+The data is sobering. Across all four benchmarks, **the
+LLM-supercompiled residuals do not reduce step counts compared to the
+original program**. Classical does — sometimes dramatically (24x on
+even-square at x=12, 5x on half-of-double).
+
+The pattern: classical (with size-bound whistle) unfolds aggressively
+and produces large residuals (328 functions on even-square) that are
+much faster. The LLM path (with HE whistle) produces small residuals
+(22 functions on even-square) that compute the same answers in the
+same number of steps as the original.
+
+This isn't because the LLM is failing — every accepted proposal is
+Lean-checked and semantically correct. It's because the
+*kind* of transformation the LLM proposes is structural
+(let-introduction over subexpressions), and structural rewrites
+preserve operation count. The kind of transformation that would
+actually speed things up — e.g., recognizing that `gEven(fSqr(x))`
+has the same parity as `gEven(x)` — is a *eureka lemma*, an insight
+that the supercompiler can't currently ask for and that "extract
+this subexpression into a let" doesn't capture.
+
+The empirical answer to "is the LLM-augmented supercompiler faster
+than classical": **not yet**. The LLM path is currently producing
+*compact, correct, machine-checked* residuals — but the speedup
+story requires the next step (distillation; LLM proposes lemmas,
+Lean proves them, residuals are rewritten using them).
 
 ## Benchmarks
 

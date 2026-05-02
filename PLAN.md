@@ -159,17 +159,53 @@ trust the LLM.
   - `fMatch(Cons(A, Cons(A, Nil)), s)` (KMP): ~37 fns, 4 LLM calls
     4/0 auto-prove (no fallbacks)
 
+- Performance comparison harness (`bench/Perf.hs`, `stack exec
+  llm-perf`): runs each benchmark through `intC` on a range of
+  concrete inputs for three programs (original / classical /
+  LLM-supercompiled) and reports step counts plus speedup ratios. Also
+  serves as a correctness check (asserts all three return the same
+  value).
+
+## Empirical finding from the perf harness
+
+Across the four benchmarks, **LLM-supercompiled residuals do not
+reduce step counts vs. the original program**, while
+classical-supercompiled residuals do (up to 24x faster on
+`even-square` at x=12, ~5x on `half-of-double`). All three variants
+compute the same values, so the LLM path is correct — it just isn't
+faster.
+
+The reason is structural: the LLM currently proposes *let-
+introductions* (extract a subexpression and bind it to a fresh var).
+Those preserve operation count. The transformations that actually
+speed things up (e.g. "`gEven(fSqr(x))` has the same parity as
+`gEven(x)`") are *eureka lemmas* — assertions about program behaviour
+that need a separate proof, not just a rename. Classical
+supercompilation gets some speedups by aggressively unfolding (the
+~24x on even-square came with a 328-function residual); the LLM with
+HE produces compact residuals (22 functions) but at the cost of
+preserving the original program's runtime shape.
+
+This validates the original PLAN framing: the LLM is only useful
+when it goes beyond what classical can do — and "let-introduction
+under HE" isn't beyond classical. The next step is therefore
+distillation: ask the LLM for actual lemmas, prove them in Lean,
+rewrite the program using them.
+
 **Not yet:**
-1. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
+1. Distillation experiments. The natural next direction given the
+   perf finding above. Concretely: when the supercompiler gets stuck
+   (HE fires repeatedly without producing a foldable shape, or the
+   residual matches the original in step count), prompt the LLM for
+   a *lemma* — e.g. `forall x, gEven(fSqr(x)) = gEven(x)` — plus a
+   Lean proof. If Lean accepts, register the lemma and rewrite
+   matching subexpressions. This is the move that gets the LLM
+   beyond what classical can do.
+2. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
    path with an Ok verdict yet across the four benchmarks. Real
    induction-needing conjectures (e.g. `gAdd x Z ≡ x`) would benefit
    from a tactic like
    `first | simp_all | (intros; induction <;> simp_all)`.
-2. Performance comparison: how do LLM-supercompiled residuals compare
-   to classical residuals on interpreter step counts? The existing
-   `intC` / `benchmark*` infrastructure in `Demonstration.hs` makes
-   this cheap to add.
-3. Distillation experiments — see "Why this matters" below.
 
 ## Why this matters
 
