@@ -16,11 +16,18 @@ data DataDef = DataDef Name [CtrDef] deriving (Eq, Show)
 -- Function signature: argument types and return type.
 type Signature = ([Type], Type)
 
--- Type environment for an SLL program: data declarations plus
--- per-function signatures. Lookup-only; no inference.
+-- Type environment for an SLL program: data declarations, per-function
+-- signatures, and an opt-in list of function names that should be
+-- emitted as `partial def` in Lean. The `partial` flag is for SLL
+-- functions whose termination Lean can't see automatically (e.g.
+-- KMP-style mutual recursion that doesn't reduce by structural
+-- subterms). Partial functions don't get equation lemmas in the simp
+-- set, but our auto-prove only needs let-elimination, not function
+-- unfolding, so this is fine in practice.
 data TypeEnv = TypeEnv
-  { typeDefs :: [DataDef]
-  , funSigs  :: [(Name, Signature)]
+  { typeDefs    :: [DataDef]
+  , funSigs     :: [(Name, Signature)]
+  , funPartial  :: [Name]
   } deriving (Eq, Show)
 
 -- Lookups. Caller is responsible for the result existing; an absent

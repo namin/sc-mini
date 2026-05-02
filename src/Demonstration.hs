@@ -46,6 +46,7 @@ prog1Types = TypeEnv
       , ("gOdd",  ([TyCon "Nat"], TyCon "Bool"))
       , ("gAdd1", ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
       ]
+  , funPartial = []
   }
 
 prog2 :: Program
@@ -84,6 +85,12 @@ prog2Types = TypeEnv
       , ("gX",      ([TyCon "LSym", TyCon "Sym", TyCon "LSym", TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
       , ("gN",      ([TyCon "LSym", TyCon "LSym"], TyCon "Bool"))
       ]
+  -- gM/gX/gN are mutually recursive without a structurally decreasing
+  -- measure (gN restarts from the original pattern). Lean can't infer
+  -- termination automatically, so we declare them partial. Our
+  -- auto-prove (`simp_all` with no defs) only needs let-elimination,
+  -- not function unfolding, so partial is fine for verification.
+  , funPartial = ["gM", "gX", "gN"]
   }
 
 -- more clear KMP test
@@ -140,6 +147,7 @@ prog3Types = TypeEnv
       , ("gEqZ",    ([TyCon "Nat"], TyCon "Bool"))
       , ("gEqS",    ([TyCon "Nat", TyCon "Nat"], TyCon "Bool"))
       ]
+  , funPartial = []
   }
 
 prog4 :: Program

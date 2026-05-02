@@ -8,28 +8,25 @@ import Types
 import LeanEmbed (embedConjecture)
 import LeanCheck (LeanProject, Verdict(..), verify)
 
-import Data.List (intercalate, nub)
-
--- All function names (f-defs and g-def groups) in the program. Used as the
--- simp_all lemma set — Lean's auto-generated equation lemmas for these
--- names give simp the means to unfold our definitions.
-allFunNames :: Program -> [Name]
-allFunNames (Program fs gs) =
-  nub $ [n | FDef n _ _ <- fs] ++ [n | GDef n _ _ _ <- gs]
-
 -- The canned auto-prove tactic. Form:
---   by intros; simp_all [gAdd, gMult, fSqr, ...]
+--   by intros; simp_all
 -- `intros` discharges any leading forall-quantifiers so simp_all can
--- pattern-match on concrete shapes; the lemma list unfolds f's and g's.
--- Sufficient for any equivalence that's definitionally true after
--- unfolding (the common case: `Let`-introductions of subexpressions).
--- Insufficient for anything that needs induction; the LLM steps in for
--- those.
+-- pattern-match on concrete shapes. We deliberately do NOT pass the
+-- program's function names as a simp set: the LLM's proposals are
+-- almost always let-introductions, and let-elimination is a default
+-- simp rule, so the conjecture closes via syntactic-equality-after-
+-- substitution without needing function-body unfolding.
+--
+-- Avoiding function-name simp arguments also dodges Lean's
+-- well-founded-vs-structural recursion divide: structurally-recursive
+-- defs accept `simp_all [f]` happily, but mutually-recursive
+-- well-founded defs (KMP-style) emit "Possibly looping simp theorem"
+-- warnings or fail to unfold. Keeping the auto-tactic free of program
+-- names sidesteps the issue entirely. Anything that genuinely needs
+-- function unfolding falls through to LLM-as-prover, which can name
+-- equation lemmas (`f.eq_def`, `f.eq_2`) explicitly.
 autoTactic :: TypeEnv -> Program -> String
-autoTactic _ p =
-  let names  = allFunNames p
-      lemmas = if null names then "" else " [" ++ intercalate ", " names ++ "]"
-  in "by intros; simp_all" ++ lemmas
+autoTactic _ _ = "by intros; simp_all"
 
 -- Render `e ≡ e'` as a Lean conjecture with the auto-tactic as proof body
 -- and ask Lean to check it. Returns the raw verdict so callers can decide

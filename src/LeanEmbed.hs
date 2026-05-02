@@ -23,9 +23,19 @@ renderType (TyCon n) = n ++ "'"
 -- inductive Foo' where
 --   | C1 : Foo'
 --   | C2 : T1 -> T2 -> Foo'
+-- deriving Inhabited
+--
+-- The `deriving Inhabited` is only required for `partial def` return
+-- types (Lean needs to fall back to a default value if the function
+-- would not terminate). We emit it unconditionally; SLL programs
+-- always have at least one nullary constructor per type, so deriving
+-- Inhabited succeeds automatically.
 renderDataDef :: DataDef -> String
 renderDataDef (DataDef tn ctrs) =
-  unlines $ ("inductive " ++ tn ++ "' where") : map renderCtr ctrs
+  unlines $
+    ("inductive " ++ tn ++ "' where") :
+    map renderCtr ctrs ++
+    ["deriving Inhabited"]
   where
     renderCtr (CtrDef cn fields) =
       "  | " ++ cn ++ " : " ++
@@ -57,6 +67,8 @@ embedExpr _ = renderExpr
 -- =========================================================================
 
 -- An f-function is a single equation: render directly as `def f a b : T := body`.
+-- Functions in `funPartial` get `partial def` instead, which skips
+-- termination checking at the cost of not generating equation lemmas.
 renderFDef :: TypeEnv -> FDef -> String
 renderFDef env (FDef fn args body) =
   case lookupSig fn env of
@@ -66,7 +78,8 @@ renderFDef env (FDef fn args body) =
           error $ "LeanEmbed: arity mismatch for " ++ fn
       | otherwise ->
           let typedArgs = zipWith typedBinder args argTys
-              header    = "def " ++ fn ++ concatMap (" " ++) typedArgs
+              kw        = if fn `elem` funPartial env then "partial def" else "def"
+              header    = kw ++ " " ++ fn ++ concatMap (" " ++) typedArgs
                           ++ " : " ++ renderType retTy ++ " :="
           in header ++ "\n  " ++ renderExpr body
 
@@ -94,7 +107,8 @@ renderGFun env name clauses@(GDef _ _ tailNames _ : _) =
                 arms = map renderArm clauses
                 body = "  match " ++ scrutName ++ " with\n"
                        ++ unlines (map ("  " ++) arms)
-            in "def " ++ name ++ concatMap (" " ++) headBinders
+                kw   = if name `elem` funPartial env then "partial def" else "def"
+            in kw ++ " " ++ name ++ concatMap (" " ++) headBinders
                ++ " : " ++ renderType retTy ++ " :=\n" ++ body
 
 renderArm :: GDef -> String

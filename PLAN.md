@@ -98,7 +98,7 @@ When the LLM proposes `e'`, we render the conjecture as:
 import Program
 
 theorem gen_ok : forall (x : Nat'), ⟦e⟧ = ⟦e'⟧ := by
-  intros; simp_all [gAdd, gMult, fSqr, gEven, gOdd, gAdd1]
+  intros; simp_all
 ```
 
 If `simp_all` discharges it, we accept `e'`. Otherwise we ask the LLM
@@ -119,31 +119,51 @@ trust the LLM.
 - Per-run lake project + verifier (`LeanCheck.hs`): one `Program.olean`
   built once, per-call `Conjecture_<n>.lean` checked via `lake env lean`
 - Two-stage proof strategy (`LeanProver.hs`): canned auto-tactic
-  `by intros; simp_all [<defs>]`, escalating to LLM-supplied proof body
-  on failure, then to classical fallback
+  `by intros; simp_all` (no defs list — let-elimination is a default
+  simp rule, and avoiding function-name simp args sidesteps the
+  well-founded-vs-structural recursion divide). Escalates to
+  LLM-supplied proof body on failure, then to classical fallback.
 - Inline back-edge detection in `bftIO`: emits `Fold` nodes during
   construction so the IO-driven tree is finite by construction
   (without it, `bftIO` stack-overflows on essentially anything since
   it can't rely on `bftPure`'s laziness)
 - Sharpened LLM prompt: requires the body of the let-chain to be a call
   with all-variable arguments, so it's foldable
+- `partial def` opt-in via `funPartial :: [Name]` in `TypeEnv` for
+  functions whose termination Lean can't see automatically (e.g.
+  KMP-style mutual recursion). Inductives derive `Inhabited`
+  unconditionally so partial defs have a default value to fall back
+  on.
+- Driving robustness fixes (`Driving.hs`): missing g-clause for a
+  constructor returns `Stop` (was a `head []` crash); the `inject`
+  helper handles `Stop` and `Decompose` cases (was non-exhaustive).
+  These shielded the supercompiler from ill-typed expressions that
+  multi-typed programs (KMP) trigger.
 - Benchmark harness (`bench/Main.hs`, `stack exec llm-bench`): runs
-  three benchmarks, captures per-benchmark trace, reports stats
-- 3/3 benchmarks pass with **all** LLM proposals Lean-verified:
-  - `gEven(fSqr(x))`: 8 LLM 8/8 verified, 6 folds
-  - `gAdd(gAdd(x, y), z)`: 2 LLM 2/2 verified, 3 folds
-  - `gEq(gHalf(gDouble(n)), n)`: 2 LLM 2/2 verified, 3 folds
+  four benchmarks, captures per-benchmark trace, reports stats. Pass
+  criterion is termination + sane residual size (not "every proposal
+  Lean-verified" — auto-prove failures are recoverable via classical
+  fallback).
+- 4/4 benchmarks pass:
+  - `gEven(fSqr(x))`: ~24 fns, ~8 LLM calls all auto-prove Ok
+  - `gAdd(gAdd(x, y), z)`: ~10 fns, 2 LLM calls all auto-prove Ok
+  - `gEq(gHalf(gDouble(n)), n)`: ~14 fns, 2 LLM calls all auto-prove Ok
+  - `fMatch(Cons(A, Cons(A, Nil)), s)` (KMP): ~27 fns, 5 LLM calls
+    with 3/2 auto-prove ok/fail (the failures hit a type-confusion in
+    the supercompiler's untyped substitution, which Lean correctly
+    rejected and we recovered via classical fallback)
 
 **Not yet:**
-1. KMP (`fMatch` in `prog2`): blocked because the mutual recursion in
-   `gM/gX/gN` passes `op/os` unchanged, so Lean's automatic structural
-   termination can't find a measure. Fix: emit `termination_by`
-   clauses with a custom lex measure.
-2. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
-   path in benchmarks yet, but algebraic facts that need induction
-   (e.g. `gAdd x Z ≡ x`) would. Once one shows up, consider
-   `first | simp_all [defs] | (intros; induction <;> simp_all [defs])`
-   before paying for an LLM proof call.
+1. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
+   path with Ok verdict yet — KMP escalations failed because the
+   conjectures themselves were type-bogus. Real induction-needing
+   conjectures (e.g. `gAdd x Z ≡ x`) would benefit from a tactic
+   like `first | simp_all | (intros; induction <;> simp_all)`.
+2. SLL type-soundness during driving: the supercompiler can produce
+   ill-typed expressions on multi-typed programs (Sym vs LSym
+   conflation in KMP). Currently shielded by the Driving fixes and
+   Lean-rejection-fallback; a proper fix would track types through
+   driving.
 3. Distillation experiments — see "Why this matters" below.
 
 ## Why this matters

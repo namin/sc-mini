@@ -110,13 +110,28 @@ each `Program`. `Types.hs` defines:
 data Type    = TyCon Name
 data CtrDef  = CtrDef Name [Type]
 data DataDef = DataDef Name [CtrDef]
-data TypeEnv = TypeEnv { typeDefs :: [DataDef], funSigs :: [(Name, Signature)] }
+data TypeEnv = TypeEnv
+  { typeDefs   :: [DataDef]
+  , funSigs    :: [(Name, Signature)]
+  , funPartial :: [Name]
+  }
 ```
 
 Each demo program has a sibling `progNTypes :: TypeEnv` (see
 `Demonstration.hs`). Every Lean inductive comes from a `DataDef`;
 every Lean function signature comes from `funSigs`; every constructor's
 field types are read out of its `DataDef`. No inference, no bail-out.
+
+The `funPartial` field lists function names to emit as `partial def`
+rather than `def`. Use it for functions whose termination Lean can't
+prove automatically (KMP's `gM/gX/gN`, where `gN` restarts from the
+original pattern so there's no structurally decreasing measure).
+Partial defs don't get equation lemmas in the simp set, but our
+auto-prove relies on let-elimination — not function unfolding — so
+`partial def` is verification-compatible for typical let-introduction
+conjectures. To make `partial def` work, every emitted inductive
+gets `deriving Inhabited` unconditionally; SLL types always have at
+least one nullary constructor, so deriving succeeds automatically.
 
 This means SLL programs that aren't well-typed under any monomorphic
 assignment simply don't get a `TypeEnv` written for them, and the
@@ -161,8 +176,16 @@ named once at the def head and reused in every arm.
 **Totality.** Each g-function's scrutinee type comes from `funSigs`,
 and the constructors of that type come from `typeDefs`. A well-formed
 SLL program covers every constructor in its clauses, so the `match`
-is exhaustive and Lean accepts it as `def`, not `partial def`. If a
-clause is missing, we treat the program as malformed and bail.
+is exhaustive. For most programs that's enough and Lean accepts the
+function as `def`. For programs whose recursion isn't structurally
+decreasing (KMP-style: gN restarts the pattern, so the measure is
+lex over (string-position, pattern-position)), Lean's automatic
+termination check fails. We don't synthesize `termination_by` clauses;
+instead the user opts those functions into `funPartial` and we emit
+`partial def`. Partial defs don't get equation lemmas in the simp
+set, but our auto-prove uses bare `simp_all` (let-elimination only),
+so they verify cleanly for the let-introduction conjecture shapes
+the supercompiler emits in practice.
 
 **Mutual recursion.** Compute the call-graph SCCs over `[FDef] ∪ [GDef]`
 and emit each non-trivial SCC inside a single `mutual … end` block.

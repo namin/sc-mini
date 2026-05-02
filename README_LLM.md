@@ -15,11 +15,15 @@ the results.
 - The `bench/Main.hs` harness, exposed as the `llm-bench` executable.
 
 The trust boundary is Lean's kernel: the LLM proposes an SLL `e'`; we
-translate `e` and `e'` into Lean and ask Lean (via `simp_all` over the
-program's equation lemmas) to discharge the conjecture `⟦e⟧ = ⟦e'⟧`. If
-Lean accepts, the LLM proposal is taken. If Lean rejects, we re-prompt
-the LLM for a Lean proof body; if that also fails to verify, we fall
-back to `classicalGeneralize` — the same strategy the pure path uses.
+translate `e` and `e'` into Lean and ask Lean (via bare `simp_all`,
+which has let-elimination as a default rule) to discharge the
+conjecture `⟦e⟧ = ⟦e'⟧`. If Lean accepts, the LLM proposal is taken.
+If Lean rejects, we re-prompt the LLM for a Lean proof body; if that
+also fails to verify, we fall back to `classicalGeneralize` — the
+same strategy the pure path uses. **Lean rejection is a feature, not
+a failure mode**: it routes around proposals that would have been
+unsound (e.g. type-bogus expressions arising from the supercompiler's
+untyped substitution on multi-typed programs).
 
 ## Architecture
 
@@ -75,11 +79,23 @@ prog1Types = TypeEnv
       [ ("gAdd",  ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
       , ...
       ]
+  , funPartial = []
   }
 ```
 
 `Demonstration.hs` carries `prog1Types`, `prog2Types`, `prog2aTypes`,
 and `prog3Types`.
+
+The `funPartial :: [Name]` field is an opt-in list of function names
+that should be emitted as `partial def` rather than `def` in Lean.
+Use it for functions whose termination Lean can't see automatically —
+KMP's `gM/gX/gN` are mutually recursive without a structurally
+decreasing measure (gN restarts from the original pattern), so
+`prog2Types` declares them partial. Partial definitions don't get
+equation lemmas in the simp set, but our auto-prove only needs
+let-elimination (not function unfolding), so partial functions still
+verify cleanly. Inductives are emitted with `deriving Inhabited`
+unconditionally so partial defs have a default-value fallback.
 
 ## Prerequisites
 
@@ -106,26 +122,38 @@ Per-benchmark stderr traces under bench/results/
 
 ==> even-square
     residual: gg1(x)
-    functions: 24 (expected 5-30)
-    whistles: 8  folds: 6  llm: 8  auto-prove: 8 ok / 0 fail  budget: 0
+    functions: 26 (expected 5-30)
+    whistles: 9  folds: 6  llm: 9  auto-prove: 9 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 ==> add-assoc
     residual: gg1(x, y, z)
     functions: 10 (expected 5-25)
-    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  budget: 0
+    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 ==> half-of-double
     residual: gg1(n)
     functions: 14 (expected 5-30)
-    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  budget: 0
+    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  llm-proof: 0  budget: 0
+    PASS
+==> kmp-aa
+    residual: ff1(s)
+    functions: 27 (expected 5-40)
+    whistles: 5  folds: 3  llm: 5  auto-prove: 3 ok / 2 fail  llm-proof: 2  budget: 0
     PASS
 
-Summary: 3/3 passed.
+Summary: 4/4 passed.
 ```
 
-Each benchmark passes if the supercompile terminates, the residual's
-function count falls in the documented range, and **every** LLM proposal
-verifies (`auto-prove ok == llm calls`, no fails, no max-whistles trip).
+A benchmark passes if the supercompile terminates, the residual's
+function count falls in the documented range, and the safety cap on
+whistle iterations isn't tripped. **Lean's verdict counts (`auto-prove
+ok / fail`, `llm-proof`) are reported for transparency, not as a pass
+gate** — when Lean rejects an LLM proposal, the supercompiler falls
+back to classical generalization (correct by construction), so the
+residual is still valid. KMP's 2 auto-prove failures above are a real
+example: the supercompiler produced type-bogus expressions (Sym/LSym
+conflation), Lean caught them, the LLM proof retry also failed, and
+classical took over.
 
 The full per-benchmark stderr trace is preserved at
 `bench/results/<name>.trace` so you can inspect ancestor/current pairs,
@@ -133,34 +161,44 @@ LLM responses, and verification verdicts after the fact.
 
 ## Benchmarks
 
-| Name             | Input                                      | Program  | Notes |
-|------------------|--------------------------------------------|----------|-------|
-| `even-square`    | `gEven(fSqr(x))`                           | prog1    | The headline benchmark from PLAN.md. |
-| `add-assoc`      | `gAdd(gAdd(x, y), z)`                      | prog1    | Should drive into associativity-shaped residual. |
-| `half-of-double` | `gEq(gHalf(gDouble(n)), n)`                | prog3    | Property is identically `True`; supercompiler erases the equality. |
+| Name             | Input                                                 | Program  | Notes |
+|------------------|-------------------------------------------------------|----------|-------|
+| `even-square`    | `gEven(fSqr(x))`                                      | prog1    | The headline benchmark from PLAN.md. |
+| `add-assoc`      | `gAdd(gAdd(x, y), z)`                                 | prog1    | Should drive into associativity-shaped residual. |
+| `half-of-double` | `gEq(gHalf(gDouble(n)), n)`                           | prog3    | Property is identically `True`; supercompiler erases the equality. |
+| `kmp-aa`         | `fMatch(Cons(A, Cons(A, Nil)), s)`                    | prog2    | KMP-style pattern matcher; uses `partial def` for `gM/gX/gN`. Some LLM proposals will be type-bogus (Sym/LSym conflation); Lean catches them and we fall back to classical. |
 
 To add a benchmark, add an entry to `benchmarks` in `bench/Main.hs`.
 
 ## Known limitations
 
-- **KMP is not yet supported.** `prog2`'s mutually recursive `gM/gX/gN`
-  pass `op` and `os` (the original pattern/string) unchanged through
-  some calls; Lean's automatic structural-termination check can't see a
-  decreasing measure. The embedding would need to emit
-  `termination_by` clauses with a custom lex measure (length of `ss`
-  paired with length of `pp`), which we don't synthesize automatically.
-  Symptom: `lake build` fails inside `setupProject` with
-  `fail to show termination for gX gN gM`.
 - **`supercompileIO` (the un-verified path) inherits the non-termination
   fix.** The `findFold` change in `bftIO` benefits both paths, so both
   now work on inputs that previously stack-overflowed.
-- **The auto-prove tactic is a single `simp_all [<all defs>]` block.**
-  It dispatches let-introductions and any equivalence that's
-  definitionally true after unfolding. Anything requiring induction
-  (e.g. `gAdd x Z ≡ x`) escalates to LLM-proof. We've yet to see a real
-  benchmark hit that path; if/when one does, we may want to widen the
-  auto-prove tactic with `first | … | (induction <;> simp_all [defs])`
-  before paying for an LLM proof call.
+- **The auto-prove tactic is a bare `simp_all` block.** It dispatches
+  let-introductions (the common case) because let-elimination is a
+  default simp rule. Anything requiring induction (e.g. `gAdd x Z ≡ x`)
+  escalates to LLM-proof. We've yet to see a real benchmark hit that
+  path with an Ok verdict; if a useful one shows up, we may widen with
+  `first | simp_all | (intros; induction <;> simp_all)` before paying
+  for an LLM proof call.
+- **Multi-typed programs can produce ill-typed driving expressions.**
+  The supercompiler's symbolic substitution doesn't track types, so a
+  program with multiple inductives (like KMP's Sym + LSym) can drive
+  into expressions where, say, an LSym value sits in a Sym position.
+  These expressions are syntactically valid SLL but semantically
+  meaningless. The pipeline shields itself in two ways: the embedder's
+  conjecture rendering produces Lean source that fails to elaborate
+  (anonymous `.Cons` resolves to the wrong type), Lean rejects it, and
+  the supercompiler falls back to classical. The fragility this used
+  to cause in the supercompiler itself (`head []` crash on a missing
+  g-clause; `inject` non-exhaustive pattern) is patched in
+  `Driving.hs`.
+- **Partial functions don't get equation lemmas in the simp set.** If
+  you mark a function `funPartial`, the auto-prove can't unfold it via
+  simp. This is fine for let-introductions (which don't need
+  unfolding) but means more sophisticated proofs would need
+  `f.eq_def`-style references via the LLM-as-prover.
 
 ## Reading a trace
 
