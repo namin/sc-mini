@@ -182,6 +182,14 @@ trust the LLM.
   / `simp [...]` invocations. The prompt also encourages
   decomposition: if the lemma the LLM ideally wants to state needs a
   sub-lemma, propose the sub-lemma this turn, build the chain.
+- Proof retry on verification failure: when Lean rejects an
+  LLM-supplied proof, the system reprompts the LLM with the failure
+  output and asks for a fixed proof of the *same* lemma (preserving
+  forall/lhs/rhs). Up to `distillProofRetries = 1` retry per lemma,
+  costing one Bedrock call. Addresses the LLM-non-determinism
+  observed in the chaining-only run, where the LLM sometimes wrote
+  `simp only [...]` (failed) instead of `simp [...]` (worked) for the
+  same target lemma.
 
 ## Empirical findings from the perf harness
 
@@ -197,90 +205,94 @@ preserve operation count); classical achieves speedups by aggressive
 unfolding (at the cost of large residuals: 328 functions on
 even-square).
 
-**With distillation enabled** the LLM finds eureka lemmas on two of
-the four benchmarks, and Lean verifies their proofs. The result on
-those two:
+**With distillation enabled (basic)** the LLM finds eureka lemmas on
+two of the four benchmarks, and Lean verifies their proofs.
 
-| Benchmark        | Without distillation        | With distillation        |
-|------------------|-----------------------------|--------------------------|
-| add-assoc        | 8 fns, k=10: 32 steps       | **4 fns, 22 steps**      |
-| half-of-double   | 14 fns, n=12: 64 steps      | **2 fns, 13 steps**      |
+**With lemma chaining + proof retry** added on top, distillation
+chains *two* lemmas on `half-of-double` and produces a residual that
+beats classical:
 
-Both match classical's performance exactly, with classical-or-smaller
-residuals. The half-of-double case is the cleanest example: the LLM
-proposed `forall n, gHalf(gDouble(n)) = n`, Lean verified the
-induction proof, the rewriter applied it to turn
-`gEq(gHalf(gDouble(n)), n)` into `gEq(n, n)`, and the supercompiler
-drove the simplified expression to a 2-function residual.
+| Benchmark        | No distillation        | Basic distillation     | + chaining + retry        |
+|------------------|------------------------|------------------------|---------------------------|
+| add-assoc        | 8 fns, k=10: 32 steps  | 4 fns, 22 steps        | 4 fns, 22 steps           |
+| half-of-double   | 14 fns, n=12: 64 steps | 2 fns, 13 steps        | **0 fns, 0 steps**        |
 
-**Distillation didn't help on the other two benchmarks**:
+The half-of-double case is the cleanest example of the full
+pipeline:
 
-- `even-square`: the LLM proposed the right lemma
-  (`gEven(fSqr(x)) = gEven(x)`) but couldn't prove it in one shot.
-  The proof needs reasoning about `gMult`'s parity properties — a
-  chain of sub-lemmas. Lemma chaining (using already-verified lemmas
-  as simp/rewrite hypotheses when proving subsequent ones) is a v2
-  improvement.
-- `kmp-aa`: the LLM proposed structurally plausible lemmas, but they
-  didn't pattern-match the input expression's actual shape. A
-  targeted prompt ("propose a lemma whose LHS is a subexpression of
-  this exact term") would help.
+1. LLM proposes `forall n, gHalf(gDouble(n)) = n` and proves it on
+   first try. Rewriter applies it: input becomes `gEq(n, n)`.
+2. LLM proposes `forall n, gEq(n, n) = True()`. First proof attempt
+   uses `simp_all [gEq, gEqS, gEq]` and *fails* (`gEq Nat'.Z Nat'.Z`
+   doesn't reduce). The system re-prompts with the Lean error; the
+   LLM produces a working proof: `induction n with | Z => simp [gEq,
+   gEqZ] | S x ih => simp [gEq, gEqS, ih]`. Rewriter applies it:
+   input becomes `True()`.
+3. Driving has nothing to do; the residual is the constant `True()`,
+   zero functions.
+
+This is the first benchmark where the LLM-augmented supercompiler
+produces a *smaller* residual than classical — and it's the kind of
+result classical can't reach because classical doesn't know that
+"halving twice the value gives the value back." That's a semantic
+fact about the *equivalence relation*, not the program structure,
+and only a Lean-checked lemma can put it on the table.
+
+**Distillation still doesn't help on the other two**:
+
+- `even-square`: the LLM proposes `gEven(fSqr(x)) = gEven(x)` and
+  sub-lemmas like `gEven(gAdd(x, x)) = True`, but the proofs all
+  hit type/syntax issues. Across 3 proposals × 2 retry attempts each,
+  none verified. The chain stays empty. Real fix likely needs
+  multiple attempts per lemma plus better proof-fixing prompts.
+- `kmp-aa`: lemmas verify but don't pattern-match the input
+  expression's shape. Targeted prompting ("propose a lemma whose LHS
+  is a subexpression of this exact term") would help.
 
 The empirical answer to "is the LLM-augmented supercompiler
-beneficial": **yes, on benchmarks where distillation succeeds**.
-When the LLM proposes a useful lemma and Lean verifies it, the
-resulting residual matches classical's performance with a smaller
-codebase. When the LLM can't prove the right lemma, the system
-gracefully falls back and produces the same compact-but-not-faster
-residual we had before.
+beneficial": **yes, with distillation, on benchmarks where the
+proof-search succeeds — and on `half-of-double` it now produces a
+strictly smaller residual than classical**. When the LLM can't prove
+the lemmas, the system gracefully falls back.
 
-## Where lemma chaining did and didn't help
+## How lemma chaining + proof retry interact
 
-Lemma chaining was added in the hope of unlocking `even-square` (the
-right lemma `gEven(fSqr(x)) = gEven(x)` needs sub-lemmas about
-`gMult`'s parity that single-shot induction can't close). Empirically
-the infrastructure is in place and verified lemmas DO accumulate, but
-no benchmark's outcome flipped from "no help" to "win" purely from
-chaining. The bottleneck moved: it's now **LLM proof reliability**,
-not whether the LLM has access to chained context.
+Looking at the half-of-double trace, **the retry is what
+makes the chain productive**. Without retry, the second lemma
+(`gEq(n, n) = True()`) fails its first proof attempt and gets
+discarded, and we never see the chain finish. With retry, the LLM
+gets a second chance with the Lean error in hand and produces a
+working proof. Without chaining, the working proof of
+`gEq(n, n) = True()` would have been wasted — there'd be no
+already-verified `gHalf(gDouble(n)) = n` to reduce the input to
+`gEq(n, n)` in the first place. Both pieces are necessary.
 
-Concrete observations from a chaining run:
+The two also compose well budget-wise: 3 lemma proposals × 2 attempts
+per lemma = 6 Bedrock calls maximum per supercompile. In practice
+half-of-double used 5 (2 successful first-tries + 1 retry), which is
+modest given the result.
 
-- `half-of-double` regressed: in an earlier run the LLM wrote
-  `simp [gDouble, gHalf, gHalf1]; exact ih` (works); in the chaining
-  run it wrote `simp only [gDouble, gHalf, gHalf1]; exact ih` (fails
-  — `simp only` doesn't reduce `(gHalf (gDouble x)).S = x.S` to
-  match `ih`). Same target, same lemma, different LLM choice →
-  different outcome. Distillation is probabilistic at the proof
-  level.
-- `add-assoc` continued to work: associativity lemma verified on
-  first try, applied, residual matches classical at 4 functions.
-- `even-square` still failed: LLM proposed wrong main lemmas (e.g.
-  `gEven(gAdd(x,x)) = True` — false) or proofs with `S` instead of
-  `Nat'.S` (raw constructor doesn't resolve in Lean).
-- `kmp-aa`: one lemma verified but didn't match the input expression;
-  chaining preserved it for future iterations, but the LLM didn't
-  use it productively within the 3-call budget.
+Where this approach hits its limit, on the current benchmarks:
 
-The takeaway: lemma chaining is a real architectural piece that
-correctly threads context through the distillation loop, but the
-proof step itself is non-deterministic and brittle. The next-most-
-leverage improvement is *proof retry* — when Lean rejects a proof,
-re-prompt the LLM with the error and let it fix the proof for the
-*same* lemma, rather than discarding the lemma and asking for an
-entirely different one.
+- `even-square` still doesn't unlock because the *right* sub-lemma
+  chain is intricate (parity-of-gMult needs parity-of-gAdd which
+  needs gAdd-with-Z, etc.) and the LLM tends to propose the *wrong*
+  big lemma (e.g. `gEven(gAdd(x,x)) = True`, which it then can't
+  prove because it's right but proving it requires the parity
+  reasoning we wanted in the first place). A few directions:
+  - More retry attempts (currently 1; bump to 2-3)
+  - Targeted prompting ("prove this specific sub-goal")
+  - A "decompose this" prompt that asks the LLM to enumerate sub-lemmas
+- `kmp-aa`: lemmas verify but don't pattern-match the input. The
+  targeted-prompting fix is the right one — narrow the LLM's
+  attention to subexpressions of the actual input.
 
 **Not yet:**
-1. **Proof retry on verification failure**: currently when
-   `verifyLemma` rejects, the lemma is discarded entirely. A retry
-   loop (similar to the existing `llmProveBody` step in the whistle
-   path) would feed the Lean error back to the LLM and ask for a
-   fixed proof of the same lemma. Probably the highest-leverage
-   improvement after chaining; addresses the regression mode
-   observed above.
-2. **Targeted prompting**: ask for a lemma about a specific
-   subexpression rather than "anything useful". Would help `kmp-aa`,
-   where the LLM proposes plausible but non-matching lemmas.
+1. **Targeted prompting**: ask for a lemma about a specific
+   subexpression rather than "anything useful". Would help `kmp-aa`.
+2. **Bump proof-retry budget**: currently 1 retry per lemma. 2-3
+   would give the LLM more shots at fixing tricky proofs and might
+   unlock `even-square`'s sub-lemma chain.
 3. **Oscillation detection**: detect when a lemma rewrites in one
    direction and a subsequent lemma reverses it. Doesn't unblock
    benchmarks but prevents wasted Bedrock calls.

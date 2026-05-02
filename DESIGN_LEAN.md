@@ -305,13 +305,24 @@ propose more.
 Same pipeline as generalization conjectures: render the lemma to a
 `Conjecture_<n>.lean` file, run `lake env lean`, accept on exit 0.
 The crucial difference: lemmas usually need induction, so bare
-`simp_all` won't discharge them — the LLM-supplied proof body is what
-gets verified. Stage 2 of the two-stage strategy finally does
+`simp_all` won't discharge them — the LLM-supplied proof body is
+what gets verified. Stage 2 of the two-stage strategy finally does
 substantive work.
 
-If the LLM's proof fails to verify, the lemma is rejected. No
-classical-style fallback applies (lemmas are LLM-territory by
-definition); we just don't apply that lemma.
+When chaining is active, all previously-verified lemmas are inlined
+above the new theorem in the Conjecture file (with their checked
+proofs). Lean accepts them, then they're available to the new proof
+as `rw [lemma_n]` / `simp [lemma_n]` rules.
+
+If the LLM's proof fails to verify, the system reprompts the LLM
+with the Lean error and asks for a fixed proof of the *same* lemma
+(forall/lhs/rhs preserved, only the `by …` body changes). Up to
+`distillProofRetries = 1` retry per lemma. The retry prompt is
+distinct from the proposal prompt — it specifies the lemma to prove
+and the prior failure verbatim, plus a small set of common-fixes
+hints (e.g. "prefer `simp` over `simp only`", "use `Nat'.S` not
+`S`"). Empirically the retry is what unlocks chained proofs that
+the LLM can't get right on the first attempt.
 
 ### What v1 doesn't do
 

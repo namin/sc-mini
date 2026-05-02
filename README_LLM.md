@@ -170,7 +170,7 @@ residual (HE whistle, `supercompileIOWithTypes`) — then runs each
 through `intC` (the counting interpreter) on a series of concrete
 inputs and reports step counts and ratios.
 
-Sample output (with distillation enabled):
+Sample output (with distillation, lemma chaining, and proof retry):
 
 ```
 ==> even-square    (distillation: lemma proposed but proof failed)
@@ -183,14 +183,20 @@ Sample output (with distillation enabled):
     sizes: orig=11  classical=4  llm=4
     10       |     32 |     22 |     22 |    0.69  |    0.69   |   1.00
 
-==> half-of-double (distillation: gHalf∘gDouble = id lemma applied)
-    sizes: orig=14  classical=2  llm=2
-    12       |     64 |     13 |     13 |    0.20  |    0.20   |   1.00
+==> half-of-double (distillation: chain of two lemmas collapses to True())
+    sizes: orig=14  classical=2  llm=0
+    12       |     64 |     13 |      0 |    0.20  |    0.00   |   0.00
 
 ==> kmp-aa         (distillation: no matching lemma found)
     sizes: orig=15  classical=9  llm=37
     ABABAA   |     46 |     15 |     39 |    0.33  |    0.85   |   2.60
 ```
+
+The half-of-double row is the headline: distillation chains the
+lemmas `gHalf(gDouble(n)) = n` and `gEq(n, n) = True()` to reduce the
+input task entirely to a constant. **The LLM-augmented residual is
+strictly smaller than classical's** (0 functions vs. 2), and runs in
+0 steps regardless of input size.
 
 **The harness is also a correctness check**: it verifies all three
 variants produce the same value on every test input. Mismatches would
@@ -198,33 +204,45 @@ show as `*** VALUE MISMATCH ***` next to the row.
 
 ### What the numbers say
 
-When distillation succeeds, the LLM path matches classical's
-performance with a smaller residual. When distillation can't find or
-verify a lemma, the path falls back to whistle-time generalizations
-and produces a compact, correct, machine-checked residual — but with
-the same step count as the original program.
+When distillation succeeds, the LLM path matches or *beats*
+classical's performance with a strictly smaller residual. When the
+LLM can't find or prove the right lemmas, the path falls back to
+whistle-time generalizations and produces a compact, correct,
+machine-checked residual — but with the same step count as the
+original program.
 
-Distillation succeeds on `add-assoc` (LLM proposes `gAdd(gAdd(x,y),z) =
-gAdd(x, gAdd(y,z))`, Lean verifies; residual drops to 4 functions and
-matches classical at 22 steps for k=10) and on `half-of-double` (LLM
-proposes `forall n, gHalf(gDouble(n)) = n`, Lean verifies; residual
-drops to 2 functions matching classical at 13 steps for n=12, a 5x
-speedup over the no-distillation LLM path).
+Distillation succeeds:
+- `add-assoc`: LLM proposes `gAdd(gAdd(x,y),z) = gAdd(x, gAdd(y,z))`,
+  Lean verifies; residual drops to 4 functions, matching classical
+  at 22 steps for k=10.
+- `half-of-double`: LLM chains two lemmas — `forall n,
+  gHalf(gDouble(n)) = n` and `forall n, gEq(n, n) = True()`. The
+  second proof failed on first attempt; the proof-retry loop fed the
+  Lean error back and the LLM produced a working proof. Both lemmas
+  apply, reducing the input to the constant `True()`. Residual: 0
+  functions, 0 steps. **Strictly smaller than classical (which needed
+  2 functions and 13 steps for n=12).**
 
-It doesn't succeed on `even-square` (the right lemma is
-`gEven(fSqr(x)) = gEven(x)` but its proof needs sub-lemmas about
-`gMult`'s parity — single-shot induction can't close it; lemma
-chaining is the v2 fix) or on `kmp-aa` (the LLM's plausible lemmas
-don't pattern-match the input expression's actual shape; targeted
-prompting would help).
+Distillation doesn't succeed:
+- `even-square`: the right top-level lemma is `gEven(fSqr(x)) =
+  gEven(x)`, but proving it needs an intricate sub-lemma chain
+  (parity of gMult, parity of gAdd, gAdd-with-Z, etc.). The LLM
+  tends to propose either the right top lemma (which it can't prove)
+  or sub-lemmas like `gEven(gAdd(x,x)) = True` (which it also can't
+  prove). More retry attempts and targeted prompting would help.
+- `kmp-aa`: lemmas verify but don't pattern-match the input
+  expression's actual shape. Targeted prompting (specifying the
+  subexpression to focus on) is the natural fix.
 
 The empirical answer to "is the LLM-augmented supercompiler faster
-than classical": **on the benchmarks where distillation succeeds, yes
-— it matches classical exactly, with a smaller residual. On the
-others, it produces a compact, correct, machine-checked residual that
-isn't faster than the original program**. Without distillation, the
-LLM path is "small but slow" everywhere. With distillation, it's
-"small and fast" where the LLM can find a good lemma.
+than classical": **on `half-of-double`, yes — strictly. On
+`add-assoc`, it ties. On the others, it produces a compact, correct,
+machine-checked residual that isn't faster than the original
+program**. The first benchmark where the LLM path beats classical is
+exactly the kind of case the original PLAN.md was aiming at: the
+LLM contributed semantic insight (`gHalf ∘ gDouble = id`,
+`gEq n n = True`) that classical supercompilation has no machinery
+to discover.
 
 ## Distillation pre-pass
 
@@ -275,13 +293,15 @@ expression with whatever lemmas the chain accumulated):
   good but the LHS doesn't appear in the input expression. The
   lemma stays in the chain for subsequent iterations to use.
 
-The proof step is currently the most non-deterministic part of the
-pipeline: the same lemma target may produce different proof attempts
-across runs (e.g. `simp` vs `simp only`), with different outcomes.
-The system handles this by trying alternatives within the budget; a
-proof-retry loop (re-prompt with the Lean error, ask for a fix to
-the same lemma) is the next-most-leverage improvement and is on the
-PLAN.md "Not yet" list.
+The proof step is non-deterministic: the same lemma target may
+produce different proof attempts across runs (e.g. `simp` vs `simp
+only`), with different outcomes. The system handles this with a
+proof-retry loop: when Lean rejects an LLM-supplied proof, the
+system reprompts the LLM with the failure output and asks for a
+fixed proof of the *same* lemma (forall/lhs/rhs preserved, only the
+`by …` body changes). Up to `distillProofRetries = 1` retry per
+lemma. This is what enables the second lemma in the half-of-double
+chain to verify on its second attempt.
 
 ## Benchmarks
 

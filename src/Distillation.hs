@@ -320,16 +320,141 @@ proposeLemma counter env prog context e name = do
 
 -- Verify a candidate lemma. The Conjecture file inlines all
 -- previously-verified lemmas so the new proof can reference them.
-verifyLemma :: TypeEnv -> Program -> [Lemma] -> Lemma -> LeanProject -> IO Bool
-verifyLemma env prog context lem proj = do
-  v <- verify proj (embedLemma env prog context lem)
-  case v of
-    Ok -> do
-      hPutStrLn stderr "  [distill] lemma verified by Lean"
-      return True
-    Failed s -> do
-      hPutStrLn stderr $ "  [distill] lemma rejected: " ++ take 200 s
-      return False
+-- On verification failure, ask the LLM to fix the proof — up to
+-- `retries` attempts. Each retry is one Bedrock call charged to the
+-- shared counter. The LHS/RHS/forall stay fixed; only the proof body
+-- changes.
+verifyLemma
+  :: IORef Int           -- LLM call counter
+  -> Int                 -- proof-retry budget (0 = no retry)
+  -> TypeEnv
+  -> Program
+  -> [Lemma]
+  -> Lemma
+  -> LeanProject
+  -> IO (Maybe Lemma)    -- Just the verified lemma (with possibly
+                         --   updated proof), or Nothing if all
+                         --   attempts failed
+verifyLemma counter retries env prog context lem proj = go 0 lem
+  where
+    go n l = do
+      v <- verify proj (embedLemma env prog context l)
+      case v of
+        Ok -> do
+          hPutStrLn stderr "  [distill] lemma verified by Lean"
+          return (Just l)
+        Failed s
+          | n >= retries -> do
+              hPutStrLn stderr $ "  [distill] lemma rejected: " ++ take 200 s
+              return Nothing
+          | otherwise -> do
+              hPutStrLn stderr $ "  [distill] proof failed (attempt "
+                ++ show (n+1) ++ "/" ++ show (retries+1) ++ "), retrying"
+              mLem' <- retryProof counter env prog context l s
+              case mLem' of
+                Nothing -> do
+                  hPutStrLn stderr "  [distill] retry produced no proof; giving up"
+                  return Nothing
+                Just l' -> go (n + 1) l'
+
+-- Ask the LLM to fix the proof of an existing lemma, given Lean's
+-- failure output. Reuses the lemma's forall/lhs/rhs verbatim; the
+-- response is just a new `by …` block.
+retryProof
+  :: IORef Int
+  -> TypeEnv
+  -> Program
+  -> [Lemma]
+  -> Lemma               -- the lemma whose proof needs fixing
+  -> String              -- Lean's stdout/stderr from the failed verify
+  -> IO (Maybe Lemma)
+retryProof counter env prog context lem err = do
+  modifyIORef' counter (+1)
+  k <- readIORef counter
+  hPutStrLn stderr $ "  [distill] retry-proof call #" ++ show k
+  let prompt = buildRetryPrompt env prog context lem err
+  result <- try (chat prompt) :: IO (Either SomeException String)
+  case result of
+    Left e -> do
+      hPutStrLn stderr $ "  [distill] LLM error during retry: " ++ show e
+      return Nothing
+    Right resp -> do
+      let body = extractProofBody resp
+      hPutStrLn stderr $ "  [distill] retry body: " ++ take 200 body
+      if null body
+        then return Nothing
+        else return (Just lem { lemmaProof = body })
+
+-- Walk the LLM response and pull out the first `by …` block. Tolerates
+-- preamble and markdown fences. Mirrors LLMSupercompiler.extractProofBody
+-- (kept local here to avoid an import cycle).
+extractProofBody :: String -> String
+extractProofBody resp =
+  stopAtFence (dropToBy (stripFences (trim resp)))
+  where
+    stripFences s = unlines [l | l <- lines s, not (isFence (trim l))]
+    isFence l = "```" `isPrefixOf` l
+    dropToBy s
+      | "by " `isPrefixOf` s  = s
+      | "by\n" `isPrefixOf` s = s
+      | null s = s
+      | otherwise = dropToBy (drop 1 s)
+    stopAtFence ('`':'`':'`':_) = ""
+    stopAtFence (c:r) = c : stopAtFence r
+    stopAtFence [] = []
+
+buildRetryPrompt :: TypeEnv -> Program -> [Lemma] -> Lemma -> String -> String
+buildRetryPrompt env prog context lem err = unlines $
+  [ "You proposed a Lean lemma but the proof failed to verify."
+  , "Please fix the proof. Keep the lemma statement (forall/lhs/rhs)"
+  , "exactly the same; only the `by …` proof body changes."
+  , ""
+  , "Type declarations:"
+  , showTypeDefs (typeDefs env)
+  , ""
+  , "Function signatures:"
+  , showFunSigs (funSigs env)
+  , ""
+  , "Program (for reference):"
+  , showSLLProgramFull prog
+  , ""
+  ] ++ contextSection ++
+  [ "Lemma to prove:"
+  , "  forall " ++ forallStr ++ ", "
+      ++ showSLL (lemmaLhs lem) ++ " = " ++ showSLL (lemmaRhs lem)
+  , ""
+  , "Your previous proof attempt:"
+  , trim (lemmaProof lem)
+  , ""
+  , "Lean's error:"
+  , take 1500 err
+  , ""
+  , "Common fixes:"
+  , "  - `simp` (without `only`) reduces more aggressively than"
+  , "    `simp only [...]` and often closes goals where `exact ih`"
+  , "    or `rfl` would otherwise fail by a constructor."
+  , "  - Use `Nat'.S` (or `LSym'.Cons` etc.) when matching on"
+  , "    constructors in `show` or `case` clauses; bare `S` won't"
+  , "    resolve in our embedding."
+  , "  - In inductive cases, `simp_all` is often enough; try it"
+  , "    before reaching for `exact ih`."
+  , "  - `rw [<lemma_name>]` to apply a previously-verified lemma."
+  , ""
+  , "Reply with ONLY the proof body — a single Lean 4 expression"
+  , "starting with `by `. No markdown fences, no explanation."
+  ]
+  where
+    forallStr = commaJoin
+      [ n ++ " : " ++ tn | (n, TyCon tn) <- lemmaForall lem ]
+    contextSection
+      | null context = []
+      | otherwise =
+          "Previously-verified lemmas (available as rewrite rules):"
+            : [ "  " ++ lemmaName l ++ ": "
+                  ++ showSLL (lemmaLhs l) ++ " = " ++ showSLL (lemmaRhs l)
+              | l <- context
+              ]
+            ++ [""]
 
 -- =========================================================================
 -- The pre-pass
@@ -345,12 +470,13 @@ verifyLemma env prog context lem proj = do
 distillTask
   :: IORef Int           -- LLM call counter (for stats)
   -> Int                 -- per-distillation budget (max proposals)
+  -> Int                 -- proof-retry budget per lemma
   -> TypeEnv
   -> Program
   -> LeanProject
   -> Expr                -- input expression
   -> IO Expr             -- distilled expression (may equal input)
-distillTask counter budget env prog proj = go 1 []
+distillTask counter budget proofRetries env prog proj = go 1 []
   where
     go i ctx e | i > budget = return e
     go i ctx e = do
@@ -359,14 +485,14 @@ distillTask counter budget env prog proj = go 1 []
       case mLem of
         Nothing  -> return e        -- LLM declined or parse failed; stop
         Just lem -> do
-          ok <- verifyLemma env prog ctx lem proj
-          if not ok
-            then go (i + 1) ctx e   -- bad proof; try another
-            else
+          mVerified <- verifyLemma counter proofRetries env prog ctx lem proj
+          case mVerified of
+            Nothing   -> go (i + 1) ctx e
+            Just lem' ->
               -- verified — accumulate in context regardless of whether
               -- it rewrites the current expression
-              let ctx' = ctx ++ [lem]
-              in case rewriteWith lem e of
+              let ctx' = ctx ++ [lem']
+              in case rewriteWith lem' e of
                    Nothing -> do
                      hPutStrLn stderr
                        "  [distill] lemma verified, kept in context (no match for e)"

@@ -41,6 +41,11 @@ maxWhistles = 200
 maxDistillLemmas :: Int
 maxDistillLemmas = 3
 
+-- Per-lemma budget for proof-fix retries when Lean rejects an
+-- LLM-supplied proof. Each retry is one additional Bedrock call.
+distillProofRetries :: Int
+distillProofRetries = 1
+
 -- A Whistle decides what to do when the homeomorphic-embedding check
 -- fires: given (ancestor, freshName, current, nameSupply), produce the
 -- expression the supercompiler should drive next. Returns IO so it can
@@ -68,7 +73,7 @@ supercompileIOWithTypes env (e, p) = do
   whistleCount <- newIORef (0 :: Int)
   proj <- setupProject env p
   hPutStrLn stderr $ "[lean] proofs dir: " ++ projDir proj
-  e' <- distillTask distillCtr maxDistillLemmas env p proj e
+  e' <- distillTask distillCtr maxDistillLemmas distillProofRetries env p proj e
   if e == e'
     then hPutStrLn stderr "[distill] no lemmas applied; driving original task"
     else hPutStrLn stderr $ "[distill] driving rewritten task: " ++ showSLL e'
