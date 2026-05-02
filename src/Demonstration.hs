@@ -190,6 +190,49 @@ prog5Types = TypeEnv
   , funPartial = []
   }
 
+-- A small arithmetic-expression interpreter with constant folding.
+--
+-- Aexp is a tiny ADT (numeric literal | addition node). gEval is the
+-- evaluator. gFold is a constant-folding optimization: if both
+-- operands of an Add are numeric literals, replace with the
+-- pre-computed sum; otherwise propagate.
+--
+-- The eureka lemma we'd hope distillation finds:
+--   forall e, gEval(gFold(e)) = gEval(e)   (semantics-preserving fold)
+-- proving it requires reasoning about gFoldAdd's two branches and
+-- their interaction with gEval — substantively harder than the
+-- list-functor identities in prog5.
+prog6 :: Program
+prog6 = [prog|
+  gAdd(Z(), y) = y;
+  gAdd(S(x), y) = S(gAdd(x, y));
+  gEval(ANum(n)) = n;
+  gEval(AAdd(e1, e2)) = gAdd(gEval(e1), gEval(e2));
+  gFold(ANum(n)) = ANum(n);
+  gFold(AAdd(e1, e2)) = gFoldAdd(gFold(e1), gFold(e2));
+  gFoldAdd(ANum(n), e2) = gFoldAddNum(e2, n);
+  gFoldAdd(AAdd(a, b), e2) = AAdd(AAdd(a, b), e2);
+  gFoldAddNum(ANum(m), n) = ANum(gAdd(n, m));
+  gFoldAddNum(AAdd(a, b), n) = AAdd(ANum(n), AAdd(a, b));
+|]
+
+prog6Types :: TypeEnv
+prog6Types = TypeEnv
+  { typeDefs =
+      [ DataDef "Nat"  [CtrDef "Z" [], CtrDef "S" [TyCon "Nat"]]
+      , DataDef "Aexp" [CtrDef "ANum" [TyCon "Nat"]
+                       , CtrDef "AAdd" [TyCon "Aexp", TyCon "Aexp"]]
+      ]
+  , funSigs =
+      [ ("gAdd",        ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      , ("gEval",       ([TyCon "Aexp"], TyCon "Nat"))
+      , ("gFold",       ([TyCon "Aexp"], TyCon "Aexp"))
+      , ("gFoldAdd",    ([TyCon "Aexp", TyCon "Aexp"], TyCon "Aexp"))
+      , ("gFoldAddNum", ([TyCon "Aexp", TyCon "Nat"], TyCon "Aexp"))
+      ]
+  , funPartial = []
+  }
+
 -- counting steps of interpreter
 demo01 =
   intC prog1 [expr|gEven(fSqr(S(S(Z()))))|]

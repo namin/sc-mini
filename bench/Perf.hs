@@ -31,14 +31,17 @@ import Supercompiler (supercompile)
 import Types
 
 import Data.List (intercalate)
+import System.Environment (getArgs)
+import System.Exit (exitFailure)
 import System.IO
 import Text.Printf (printf)
 
 data PerfBench = PerfBench
-  { pbName  :: String
-  , pbTask  :: Task
-  , pbTypes :: TypeEnv
-  , pbCases :: [(String, Subst)]
+  { pbName    :: String
+  , pbTask    :: Task
+  , pbTypes   :: TypeEnv
+  , pbCases   :: [(String, Subst)]
+  , pbDefault :: Bool   -- include in default (no-args) run?
   }
 
 -- KMP test inputs are lists of A/B symbols.
@@ -58,32 +61,34 @@ lnat :: [Int] -> Expr
 lnat []     = Ctr "Nil" []
 lnat (x:xs) = Ctr "Cons" [nat x, lnat xs]
 
+-- Aexp constructors for prog6.
+aNum :: Int -> Expr
+aNum n = Ctr "ANum" [nat n]
+
+aAdd :: Expr -> Expr -> Expr
+aAdd e1 e2 = Ctr "AAdd" [e1, e2]
+
 -- Test cases per benchmark. Inputs scale up so we can see whether the
 -- residual gets faster as the input grows (a constant-factor speedup
 -- shows up everywhere; an asymptotic speedup widens with input size).
 benchmarks :: [PerfBench]
 benchmarks =
-  [ PerfBench
-      "even-square"
-      ([expr|gEven(fSqr(x))|], prog1)
-      prog1Types
+  [ PerfBench "even-square"
+      ([expr|gEven(fSqr(x))|], prog1) prog1Types
       [(show k, [("x", peano k)]) | k <- [0, 2, 4, 6, 8, 10, 12]]
-  , PerfBench
-      "add-assoc"
-      ([expr|gAdd(gAdd(x, y), z)|], prog1)
-      prog1Types
+      True
+  , PerfBench "add-assoc"
+      ([expr|gAdd(gAdd(x, y), z)|], prog1) prog1Types
       [ (show k, [("x", peano k), ("y", peano k), ("z", peano k)])
       | k <- [0, 1, 2, 4, 6, 8, 10]
       ]
-  , PerfBench
-      "half-of-double"
-      ([expr|gEq(gHalf(gDouble(n)), n)|], prog3)
-      prog3Types
+      True
+  , PerfBench "half-of-double"
+      ([expr|gEq(gHalf(gDouble(n)), n)|], prog3) prog3Types
       [(show k, [("n", peano k)]) | k <- [0, 2, 4, 6, 8, 10, 12]]
-  , PerfBench
-      "kmp-aa"
-      ([expr|fMatch(Cons(A(), Cons(A(), Nil())), s)|], prog2)
-      prog2Types
+      True
+  , PerfBench "kmp-aa"
+      ([expr|fMatch(Cons(A(), Cons(A(), Nil())), s)|], prog2) prog2Types
       [ ("AA",          [("s", lsym [A, A])])
       , ("BAA",         [("s", lsym [B, A, A])])
       , ("BABA",        [("s", lsym [B, A, B, A])])
@@ -91,38 +96,57 @@ benchmarks =
       , ("ABABAA",      [("s", lsym [A, B, A, B, A, A])])
       , ("BBBBAA",      [("s", lsym [B, B, B, B, A, A])])
       ]
-  , PerfBench
-      "add-commute"
-      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
-      prog3Types
+      True
+  , PerfBench "add-commute"
+      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3) prog3Types
       [ (show k ++ "/" ++ show (k+1),
          [("x", peano k), ("y", peano (k+1))])
       | k <- [0, 1, 2, 4, 6, 8, 10]
       ]
-  , PerfBench
-      "reverse-involution"
-      ([expr|gReverse(gReverse(xs))|], prog5)
-      prog5Types
+      True
+  , PerfBench "reverse-involution"
+      ([expr|gReverse(gReverse(xs))|], prog5) prog5Types
       [ ("len" ++ show n, [("xs", lnat (take n [0..]))])
       | n <- [0, 1, 2, 3, 5, 7, 10]
       ]
-  , PerfBench
-      "length-distributes"
-      ([expr|gLength(gAppend(xs, ys))|], prog5)
-      prog5Types
+      True
+  , PerfBench "length-distributes"
+      ([expr|gLength(gAppend(xs, ys))|], prog5) prog5Types
       [ (show m ++ "+" ++ show n,
          [("xs", lnat (take m [0..])), ("ys", lnat (take n [0..]))])
       | (m, n) <- [(0,0), (1,1), (2,3), (3,2), (5,5), (7,3), (10,10)]
       ]
+      True
+  -- eval-fold: tier 2 interpreter benchmark. Slow and tends to
+  -- distill-fail; opt-in only via explicit name argument.
+  , PerfBench "eval-fold"
+      ([expr|gEval(gFold(e))|], prog6) prog6Types
+      [ ("3+5",    [("e", aAdd (aNum 3) (aNum 5))])
+      , ("(2+3)+4", [("e", aAdd (aAdd (aNum 2) (aNum 3)) (aNum 4))])
+      , ("2+(3+4)", [("e", aAdd (aNum 2) (aAdd (aNum 3) (aNum 4)))])
+      , ("nested", [("e", aAdd (aAdd (aNum 1) (aNum 2))
+                                (aAdd (aNum 3) (aNum 4)))])
+      ]
+      False
   ]
 
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
+  args <- getArgs
+  let selected = case args of
+        []    -> filter pbDefault benchmarks
+        names -> filter (\b -> pbName b `elem` names) benchmarks
+  case (args, selected) of
+    (a:_, []) -> do
+      putStrLn $ "No benchmark matches: " ++ show a
+      putStrLn $ "Available: " ++ unwords (map pbName benchmarks)
+      exitFailure
+    _ -> return ()
   putStrLn "Performance comparison: original vs classical vs LLM-supercompiled."
   putStrLn "(This makes real Bedrock calls for the LLM residuals.)"
   putStrLn ""
-  mapM_ runPerf benchmarks
+  mapM_ runPerf selected
   putStrLn ""
   putStrLn "Lower step counts are faster. Ratios <1.0 mean speedup, >1.0 mean slowdown."
 

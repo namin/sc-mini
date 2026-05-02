@@ -114,9 +114,26 @@ Two harnesses, both make real Bedrock calls:
 
 ```
 stack build
-stack exec llm-bench   # correctness/verification harness (4 benchmarks)
-stack exec llm-perf    # performance comparison: orig vs classical vs LLM
+stack exec llm-bench           # correctness/verification harness (all)
+stack exec llm-perf            # performance comparison (all benchmarks)
 ```
+
+Both harnesses accept benchmark names as arguments to run a subset —
+useful when iterating on a single hard case without paying for the
+whole suite each time:
+
+```
+stack exec llm-bench reverse-involution
+stack exec llm-perf  half-of-double eval-fold
+```
+
+If a name doesn't match any benchmark, the harness prints the
+available list and exits with non-zero status.
+
+Some benchmarks are marked **opt-in** and skipped from the no-args
+default run because they're slow or known to surface only an
+informative failure (e.g. `eval-fold`). Run them explicitly by name
+to include them.
 
 Expected output (numbers vary because the LLM is non-deterministic):
 
@@ -382,6 +399,7 @@ chain to verify on its second attempt.
 | `add-commute`        | `gEq(gAdd(x, y), gAdd(y, x))`                         | prog3    | Hard chain: needs gAdd-right-id and gAdd-succ-right as helpers, then commutativity. Helpers verify, commutativity doesn't. |
 | `reverse-involution` | `gReverse(gReverse(xs))`                              | prog5    | List-functor identity — collapses to `xs`. **List benchmark; demonstrates approach generalizes beyond Peano.** |
 | `length-distributes` | `gLength(gAppend(xs, ys))`                            | prog5    | Homomorphism. LLM proposes the canonical equation but its RHS isn't simpler than the LHS — the rewrite is a refactoring, not an optimization. |
+| `eval-fold` (opt-in) | `gEval(gFold(e))`                                     | prog6    | Tier 2 interpreter benchmark (constant folding for arithmetic expressions). Both LLM and classical supercompile stall on this input — sc-mini engine ceiling, not an LLM-extension limit. **Excluded from default no-args runs**; pass the name explicitly to opt in. |
 
 To add a benchmark, add an entry to `benchmarks` in `bench/Main.hs`.
 

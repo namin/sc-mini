@@ -231,6 +231,7 @@ seven-benchmark suite is:
 | add-commute          | 207 / 25           | 14 / 67 (matches original)     |
 | reverse-involution   | 48 / 42            | **0 / 0** (beats classical)    |
 | length-distributes   | 4 / 22             | 10 / 33 (regresses)            |
+| eval-fold (opt-in)   | (stalls)           | (stalls)                       |
 
 The cleanest wins:
 
@@ -276,6 +277,21 @@ The informative failures:
   *substantively cheaper* than the LHS, not just structurally
   different. The prompt does say "RHS structurally simpler" but the
   LLM overrode that with the canonical homomorphism equation.
+- **eval-fold** (tier 2 interpreter benchmark, opt-in only): the
+  input is `gEval(gFold(e))` over a small expression ADT (Aexp =
+  ANum | AAdd) with constant folding. **Both LLM and classical
+  supercompile stall on this input** — classical runs for 100+
+  seconds without producing output; LLM runs for 12+ minutes. The
+  LLM's distillation phase did identify the eureka lemma
+  (`gEval(gFold(e)) = gEval(e)`) and a useful sub-lemma, but neither
+  proof verified (Aexp/Aexp' confusion, introN errors). Then the
+  whistle-time path engaged successfully (4 whistles, 4 verifications
+  Ok, 10 folds) before the post-bftIO residuation phase stalled. The
+  classical supercompile (no LLM at all) also stalls — pure
+  Haskell, no Bedrock or Lean overhead. Conclusion: this benchmark
+  is at the complexity ceiling of the upstream sc-mini engine, not
+  of our LLM extension. Tier 2 results would require either
+  accepting the time cost or improving the underlying supercompiler.
 
 ## The variance floor
 
@@ -319,7 +335,12 @@ The five mechanisms compose:
   whereas previously only the latter applied.
 
 The remaining variance and the `add-commute` holdout point at
-LLM-side proof unreliability, not at the architecture.
+LLM-side proof unreliability, not at the architecture. **Three
+benchmarks now exhibit "LLM identifies right lemma, can't prove it"**:
+add-commute (commutativity), eval-fold (gEval∘gFold preservation),
+and the gMult-flavored variant of even-square (when it doesn't land
+the fSqr-flavored proof). This is a strong empirical signal that
+multi-sample proof proposals are the highest-leverage next move.
 
 **Not yet:**
 1. **Reject lemmas that don't reduce work**: pre-filter LLM proposals

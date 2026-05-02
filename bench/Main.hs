@@ -28,6 +28,7 @@ import Control.Exception (try, SomeException)
 import Data.List (isInfixOf)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.Directory (createDirectoryIfMissing)
+import System.Environment (getArgs)
 import System.Exit (exitFailure)
 import System.IO
 
@@ -36,45 +37,30 @@ data Benchmark = Benchmark
   , benchTask     :: Task
   , benchTypes    :: TypeEnv
   , benchExpected :: (Int, Int)  -- inclusive range for residual function count
+  , benchDefault  :: Bool        -- include in default (no-args) run?
   }
 
 benchmarks :: [Benchmark]
 benchmarks =
-  [ Benchmark
-      "even-square"
-      ([expr|gEven(fSqr(x))|], prog1)
-      prog1Types
-      (5, 30)
-  , Benchmark
-      "add-assoc"
-      ([expr|gAdd(gAdd(x, y), z)|], prog1)
-      prog1Types
-      (5, 25)
-  , Benchmark
-      "half-of-double"
-      ([expr|gEq(gHalf(gDouble(n)), n)|], prog3)
-      prog3Types
-      (5, 30)
-  , Benchmark
-      "kmp-aa"
-      ([expr|fMatch(Cons(A(), Cons(A(), Nil())), s)|], prog2)
-      prog2Types
-      (5, 40)
-  , Benchmark
-      "add-commute"
-      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
-      prog3Types
-      (0, 40)
-  , Benchmark
-      "reverse-involution"
-      ([expr|gReverse(gReverse(xs))|], prog5)
-      prog5Types
-      (0, 40)
-  , Benchmark
-      "length-distributes"
-      ([expr|gLength(gAppend(xs, ys))|], prog5)
-      prog5Types
-      (0, 40)
+  [ Benchmark "even-square"
+      ([expr|gEven(fSqr(x))|], prog1) prog1Types (5, 30) True
+  , Benchmark "add-assoc"
+      ([expr|gAdd(gAdd(x, y), z)|], prog1) prog1Types (5, 25) True
+  , Benchmark "half-of-double"
+      ([expr|gEq(gHalf(gDouble(n)), n)|], prog3) prog3Types (5, 30) True
+  , Benchmark "kmp-aa"
+      ([expr|fMatch(Cons(A(), Cons(A(), Nil())), s)|], prog2) prog2Types (5, 40) True
+  , Benchmark "add-commute"
+      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3) prog3Types (0, 40) True
+  , Benchmark "reverse-involution"
+      ([expr|gReverse(gReverse(xs))|], prog5) prog5Types (0, 40) True
+  , Benchmark "length-distributes"
+      ([expr|gLength(gAppend(xs, ys))|], prog5) prog5Types (0, 40) True
+  -- eval-fold: tier 2 interpreter benchmark. Distillation tends to fail
+  -- (LLM proof reliability) and the supercompile alone is heavy; opt-in
+  -- only via explicit name argument.
+  , Benchmark "eval-fold"
+      ([expr|gEval(gFold(e))|], prog6) prog6Types (0, 50) False
   ]
 
 data Stats = Stats
@@ -165,12 +151,23 @@ runBench traceDir b = do
 
 main :: IO ()
 main = do
+  args <- getArgs
+  let selected = case args of
+        []    -> filter benchDefault benchmarks
+        names -> filter (\b -> benchName b `elem` names) benchmarks
+  case (args, selected) of
+    (a:_, []) -> do
+      putStrLn $ "No benchmark matches: " ++ show a
+      putStrLn $ "Available: "
+                 ++ unwords (map benchName benchmarks)
+      exitFailure
+    _ -> return ()
   let traceDir = "bench/results"
   createDirectoryIfMissing True traceDir
   putStrLn "Running LLM-supercompiler benchmarks (real Bedrock calls)."
   putStrLn $ "Per-benchmark stderr traces under " ++ traceDir ++ "/"
   putStrLn ""
-  results <- mapM (runBench traceDir) benchmarks
+  results <- mapM (runBench traceDir) selected
   let passed = length (filter id results)
       total  = length results
   putStrLn ""
