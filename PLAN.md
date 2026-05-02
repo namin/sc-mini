@@ -144,26 +144,31 @@ trust the LLM.
   criterion is termination + sane residual size (not "every proposal
   Lean-verified" — auto-prove failures are recoverable via classical
   fallback).
-- 4/4 benchmarks pass:
-  - `gEven(fSqr(x))`: ~24 fns, ~8 LLM calls all auto-prove Ok
-  - `gAdd(gAdd(x, y), z)`: ~10 fns, 2 LLM calls all auto-prove Ok
-  - `gEq(gHalf(gDouble(n)), n)`: ~14 fns, 2 LLM calls all auto-prove Ok
-  - `fMatch(Cons(A, Cons(A, Nil)), s)` (KMP): ~27 fns, 5 LLM calls
-    with 3/2 auto-prove ok/fail (the failures hit a type-confusion in
-    the supercompiler's untyped substitution, which Lean correctly
-    rejected and we recovered via classical fallback)
+- Name-collision fix in `bftIO`: after the whistle, LLM-proposed
+  expressions can introduce variables (e.g. `v5`, `v6`) that collide
+  with the next prefix of the supply. When `scrutinize` later draws
+  fresh pattern vars from the supply, those names get conflated with
+  pre-existing free vars of different types — producing the type-bogus
+  expressions that Lean was catching and rejecting on KMP. Filtering
+  the LLM-introduced names out of the supply (`ns \\ vnames gen`)
+  before recursing fixes it at the source.
+- 4/4 benchmarks pass with **all** LLM proposals Lean-verified:
+  - `gEven(fSqr(x))`: ~22 fns, ~5 LLM calls 5/0 auto-prove
+  - `gAdd(gAdd(x, y), z)`: ~8 fns, 1 LLM call 1/0 auto-prove
+  - `gEq(gHalf(gDouble(n)), n)`: ~14 fns, 1 LLM call 1/0 auto-prove
+  - `fMatch(Cons(A, Cons(A, Nil)), s)` (KMP): ~37 fns, 4 LLM calls
+    4/0 auto-prove (no fallbacks)
 
 **Not yet:**
 1. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
-   path with Ok verdict yet — KMP escalations failed because the
-   conjectures themselves were type-bogus. Real induction-needing
-   conjectures (e.g. `gAdd x Z ≡ x`) would benefit from a tactic
-   like `first | simp_all | (intros; induction <;> simp_all)`.
-2. SLL type-soundness during driving: the supercompiler can produce
-   ill-typed expressions on multi-typed programs (Sym vs LSym
-   conflation in KMP). Currently shielded by the Driving fixes and
-   Lean-rejection-fallback; a proper fix would track types through
-   driving.
+   path with an Ok verdict yet across the four benchmarks. Real
+   induction-needing conjectures (e.g. `gAdd x Z ≡ x`) would benefit
+   from a tactic like
+   `first | simp_all | (intros; induction <;> simp_all)`.
+2. Performance comparison: how do LLM-supercompiled residuals compare
+   to classical residuals on interpreter step counts? The existing
+   `intC` / `benchmark*` infrastructure in `Demonstration.hs` makes
+   this cheap to add.
 3. Distillation experiments — see "Why this matters" below.
 
 ## Why this matters

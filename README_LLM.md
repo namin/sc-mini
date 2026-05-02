@@ -122,23 +122,23 @@ Per-benchmark stderr traces under bench/results/
 
 ==> even-square
     residual: gg1(x)
-    functions: 26 (expected 5-30)
-    whistles: 9  folds: 6  llm: 9  auto-prove: 9 ok / 0 fail  llm-proof: 0  budget: 0
+    functions: 22 (expected 5-30)
+    whistles: 5  folds: 6  llm: 5  auto-prove: 5 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 ==> add-assoc
     residual: gg1(x, y, z)
-    functions: 10 (expected 5-25)
-    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  llm-proof: 0  budget: 0
+    functions: 8 (expected 5-25)
+    whistles: 1  folds: 3  llm: 1  auto-prove: 1 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 ==> half-of-double
     residual: gg1(n)
     functions: 14 (expected 5-30)
-    whistles: 2  folds: 3  llm: 2  auto-prove: 2 ok / 0 fail  llm-proof: 0  budget: 0
+    whistles: 1  folds: 3  llm: 1  auto-prove: 1 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 ==> kmp-aa
     residual: ff1(s)
-    functions: 27 (expected 5-40)
-    whistles: 5  folds: 3  llm: 5  auto-prove: 3 ok / 2 fail  llm-proof: 2  budget: 0
+    functions: 37 (expected 5-40)
+    whistles: 4  folds: 4  llm: 4  auto-prove: 4 ok / 0 fail  llm-proof: 0  budget: 0
     PASS
 
 Summary: 4/4 passed.
@@ -150,10 +150,7 @@ whistle iterations isn't tripped. **Lean's verdict counts (`auto-prove
 ok / fail`, `llm-proof`) are reported for transparency, not as a pass
 gate** — when Lean rejects an LLM proposal, the supercompiler falls
 back to classical generalization (correct by construction), so the
-residual is still valid. KMP's 2 auto-prove failures above are a real
-example: the supercompiler produced type-bogus expressions (Sym/LSym
-conflation), Lean caught them, the LLM proof retry also failed, and
-classical took over.
+residual is still valid.
 
 The full per-benchmark stderr trace is preserved at
 `bench/results/<name>.trace` so you can inspect ancestor/current pairs,
@@ -166,7 +163,7 @@ LLM responses, and verification verdicts after the fact.
 | `even-square`    | `gEven(fSqr(x))`                                      | prog1    | The headline benchmark from PLAN.md. |
 | `add-assoc`      | `gAdd(gAdd(x, y), z)`                                 | prog1    | Should drive into associativity-shaped residual. |
 | `half-of-double` | `gEq(gHalf(gDouble(n)), n)`                           | prog3    | Property is identically `True`; supercompiler erases the equality. |
-| `kmp-aa`         | `fMatch(Cons(A, Cons(A, Nil)), s)`                    | prog2    | KMP-style pattern matcher; uses `partial def` for `gM/gX/gN`. Some LLM proposals will be type-bogus (Sym/LSym conflation); Lean catches them and we fall back to classical. |
+| `kmp-aa`         | `fMatch(Cons(A, Cons(A, Nil)), s)`                    | prog2    | KMP-style pattern matcher; uses `partial def` for `gM/gX/gN`. |
 
 To add a benchmark, add an entry to `benchmarks` in `bench/Main.hs`.
 
@@ -182,18 +179,16 @@ To add a benchmark, add an entry to `benchmarks` in `bench/Main.hs`.
   path with an Ok verdict; if a useful one shows up, we may widen with
   `first | simp_all | (intros; induction <;> simp_all)` before paying
   for an LLM proof call.
-- **Multi-typed programs can produce ill-typed driving expressions.**
-  The supercompiler's symbolic substitution doesn't track types, so a
-  program with multiple inductives (like KMP's Sym + LSym) can drive
-  into expressions where, say, an LSym value sits in a Sym position.
-  These expressions are syntactically valid SLL but semantically
-  meaningless. The pipeline shields itself in two ways: the embedder's
-  conjecture rendering produces Lean source that fails to elaborate
-  (anonymous `.Cons` resolves to the wrong type), Lean rejects it, and
-  the supercompiler falls back to classical. The fragility this used
-  to cause in the supercompiler itself (`head []` crash on a missing
-  g-clause; `inject` non-exhaustive pattern) is patched in
-  `Driving.hs`.
+- **Name discipline at the LLM-supercompiler boundary.** The LLM may
+  pick variable names that overlap with the supercompiler's pending
+  fresh-name supply. Without care, this produces type-bogus expressions
+  (a fresh Sym-typed pattern var ends up sharing a name with a
+  pre-existing LSym-typed variable, etc.). `bftIO` filters
+  LLM-introduced names out of the supply (`ns \\ vnames gen`) after
+  every whistle-resolved generalization to keep names disjoint. (Same
+  fragility used to crash the supercompiler with `head []` on a
+  missing g-clause and a non-exhaustive `inject`; both patched in
+  `Driving.hs`.)
 - **Partial functions don't get equation lemmas in the simp set.** If
   you mark a function `funPartial`, the auto-prove can't unfold it via
   simp. This is fine for let-introductions (which don't need

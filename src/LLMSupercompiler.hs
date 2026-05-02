@@ -119,7 +119,16 @@ bftIO w d (n:ns) hist e
       hPutStrLn stderr $ "    ancestor:  " ++ showSLL anc
       hPutStrLn stderr $ "    current:   " ++ showSLL e
       gen <- w anc n e ns
-      bftIO w d ns hist gen
+      -- Critical: the LLM (or msg) may have introduced variable names
+      -- that overlap with the next prefix of the supply. If we recurse
+      -- with `ns` as-is, scrutinize will pull names from `ns` for
+      -- pattern-bound variables, and those names may already be free
+      -- in `gen` — corrupting type discipline (a fresh Sym-typed
+      -- pattern var ends up sharing a name with a pre-existing
+      -- LSym-typed variable, etc.). Filtering the names actually used
+      -- in `gen` out of the supply restores fresh-name uniqueness.
+      let ns' = filter (`notElem` vnames gen) ns
+      bftIO w d ns' hist gen
 bftIO w d ns hist t = case d ns t of
   Decompose ds -> do
     cs <- mapM (bftIO w d ns hist') ds
