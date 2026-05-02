@@ -28,6 +28,12 @@ import System.IO (hPutStrLn, stderr)
 maxLLMCalls :: Int
 maxLLMCalls = 10
 
+-- Hard upper bound on total HE-whistle firings per supercompile run.
+-- A safety net against non-converging generalization strategies; the
+-- pure path on the demo programs uses well under 50.
+maxWhistles :: Int
+maxWhistles = 200
+
 -- A Whistle decides what to do when the homeomorphic-embedding check
 -- fires: given (ancestor, freshName, current, nameSupply), produce the
 -- expression the supercompiler should drive next. Returns IO so it can
@@ -38,23 +44,35 @@ type Whistle = Conf -> Name -> Conf -> NameSupply -> IO Conf
 supercompileIO :: Task -> IO Task
 supercompileIO (e, p) = do
   counter <- newIORef (0 :: Int)
-  let w = mkUnverifiedWhistle counter p
+  whistleCount <- newIORef (0 :: Int)
+  let w = guardWhistles whistleCount (mkUnverifiedWhistle counter p)
   tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
   return $ residuate $ simplify $ foldTree tree
 
 -- New entry point: LLM proposes generalizations and either auto-prove or
 -- LLM-supplied Lean proof must verify before we accept them. On any
--- verification failure path we fall back to msgToLet.
+-- verification failure path we fall back to classical generalization.
 supercompileIOWithTypes :: TypeEnv -> Task -> IO Task
 supercompileIOWithTypes env (e, p) = do
   counter <- newIORef (0 :: Int)
+  whistleCount <- newIORef (0 :: Int)
   proj <- setupProject env p
   hPutStrLn stderr $ "[lean] proofs dir: " ++ projDir proj
-  let w = mkVerifiedWhistle counter env p proj
+  let w = guardWhistles whistleCount (mkVerifiedWhistle counter env p proj)
   tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
   let result = residuate $ simplify $ foldTree tree
   teardownProject proj
   return result
+
+-- Wrap any Whistle with a hard iteration cap, to fail fast on
+-- non-converging strategies instead of looping forever.
+guardWhistles :: IORef Int -> Whistle -> Whistle
+guardWhistles ref inner anc n e ns = do
+  k <- atomicModifyIORef' ref (\i -> let i' = i + 1 in (i', i'))
+  if k > maxWhistles
+    then error $ "supercompileIO: exceeded maxWhistles="
+                  ++ show maxWhistles ++ " — non-converging generalization"
+    else inner anc n e ns
 
 supercompilePure :: Task -> Task
 supercompilePure (e, p) =
@@ -75,15 +93,21 @@ bftPure d ns hist t = case d ns t of
 -- IO version with HE whistle. The Whistle parameter decides what
 -- generalized expression to use when HE fires; this layer is purely
 -- structural and doesn't know about LLM or Lean.
+--
+-- After a generalization, we keep the full history (including the
+-- matched ancestor) — same as bftPure. The generalized expr is a Let
+-- (not a call), so the whistle doesn't immediately re-fire; later, when
+-- driving the Let's subterms, the preserved ancestor lets foldTree find
+-- back-edges. Removing the ancestor (as the original bftIO did) breaks
+-- folding for any subterm that should match it.
 bftIO :: Whistle -> Machine Conf -> NameSupply -> [Conf] -> Conf -> IO (Tree Conf)
 bftIO w d (n:ns) hist e
   | whistleCandidate e, Just anc <- findEmbedding hist e = do
-      let hist' = filter (/= anc) hist
       hPutStrLn stderr "  [whistle] HE detected"
       hPutStrLn stderr $ "    ancestor:  " ++ showSLL anc
       hPutStrLn stderr $ "    current:   " ++ showSLL e
       gen <- w anc n e ns
-      bftIO w d ns hist' gen
+      bftIO w d ns hist gen
 bftIO w d ns hist t = case d ns t of
   Decompose ds -> do
     cs <- mapM (bftIO w d ns hist') ds
@@ -264,24 +288,42 @@ buildPrompt prog ancestor expr freshName =
     , showSLLProgram prog
     , ""
     , "The homeomorphic embedding whistle has fired. The current expression"
-    , "is a structurally larger version of an ancestor in the process tree:"
+    , "is structurally larger than an ancestor in the process tree:"
     , ""
     , "  ancestor: " ++ showSLL ancestor
     , "  current:  " ++ showSLL expr
     , ""
-    , "The current term has GROWN compared to the ancestor. To ensure"
-    , "termination, extract a subexpression into a let-binding using"
-    , "fresh variable '" ++ freshName ++ "'."
+    , "Rewrite `current` as a let-chain"
     , ""
-    , "The goal: after extracting, the remaining call should be similar"
-    , "enough to the ancestor that it can FOLD BACK (creating a loop"
-    , "in the residual program instead of infinite unfolding)."
+    , "  let v_1 = E_1 in let v_2 = E_2 in ... in CALL(a_1, ..., a_k)"
     , ""
-    , "Look at what changed between ancestor and current — the NEW"
-    , "subexpressions are what should be extracted."
+    , "subject to ALL of these:"
     , ""
-    , "Reply with ONLY the let-expression. No explanation."
-    , "Example: let " ++ freshName ++ " = gAdd(x, y) in gMult(" ++ freshName ++ ", z)"
+    , "  (1) Every a_i is a PLAIN VARIABLE (a Var — not a Ctr, FCall, or GCall)."
+    , "      The body call's arguments must each be a single identifier."
+    , "  (2) CALL has the same head function as `current`'s outermost call."
+    , "  (3) Substituting the v_j's back into the body must equal `current`."
+    , "  (4) Pull out EVERY non-variable argument. Do not leave any S(...),"
+    , "      Cons(...), constructor, or call inside the final body's argument list."
+    , ""
+    , "Reason: the supercompiler only folds back to the ancestor when the body"
+    , "is a renaming of an ancestor, i.e. has the same head and only variable"
+    , "arguments. If even one argument is non-variable, the whistle fires"
+    , "again on a deeper structure and we never converge."
+    , ""
+    , "Use '" ++ freshName ++ "' as one of the v_j's; pick fresh v_<n> names"
+    , "for any others you need (avoid names already in `current`)."
+    , ""
+    , "Reply with ONLY the let-expression. No explanation, no markdown."
+    , ""
+    , "Examples:"
+    , "  current: gMult(S(x), gAdd(x, S(y)))"
+    , "  CORRECT:   let " ++ freshName ++ " = S(x) in let v9 = gAdd(x, S(y)) in gMult(" ++ freshName ++ ", v9)"
+    , "  WRONG:     let " ++ freshName ++ " = gAdd(x, S(y)) in gMult(S(x), " ++ freshName ++ ")"
+    , "             (body still has S(x), a non-variable argument)"
+    , ""
+    , "  current: gAdd(S(v1), gMult(v1, S(v1)))"
+    , "  CORRECT:   let " ++ freshName ++ " = S(v1) in let v9 = gMult(v1, S(v1)) in gAdd(" ++ freshName ++ ", v9)"
     ]
 
 showSLLProgram :: Program -> String
