@@ -19,6 +19,7 @@ import Types (TypeEnv)
 import LeanEmbed (embedConjecture)
 import LeanCheck (LeanProject, projDir, Verdict(..), setupProject, verify, teardownProject)
 import LeanProver (tryAuto)
+import Distillation (distillTask)
 
 import Data.List (intercalate, isPrefixOf)
 import Data.IORef
@@ -33,6 +34,12 @@ maxLLMCalls = 10
 -- pure path on the demo programs uses well under 50.
 maxWhistles :: Int
 maxWhistles = 200
+
+-- Per-supercompile budget for distillation lemma proposals (pre-pass).
+-- Each proposal costs one Bedrock call. Independent of `maxLLMCalls`,
+-- which caps whistle-time generalization calls.
+maxDistillLemmas :: Int
+maxDistillLemmas = 3
 
 -- A Whistle decides what to do when the homeomorphic-embedding check
 -- fires: given (ancestor, freshName, current, nameSupply), produce the
@@ -49,17 +56,24 @@ supercompileIO (e, p) = do
   tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
   return $ residuate $ simplify $ foldTree tree
 
--- New entry point: LLM proposes generalizations and either auto-prove or
--- LLM-supplied Lean proof must verify before we accept them. On any
--- verification failure path we fall back to classical generalization.
+-- New entry point: distillation pre-pass (LLM proposes Lean-verified
+-- lemmas to rewrite the input task), then the verified-whistle drive.
+-- LLM proposals are accepted only if Lean verifies them. On any
+-- verification failure path during driving we fall back to classical
+-- generalization.
 supercompileIOWithTypes :: TypeEnv -> Task -> IO Task
 supercompileIOWithTypes env (e, p) = do
-  counter <- newIORef (0 :: Int)
+  counter      <- newIORef (0 :: Int)
+  distillCtr   <- newIORef (0 :: Int)
   whistleCount <- newIORef (0 :: Int)
   proj <- setupProject env p
   hPutStrLn stderr $ "[lean] proofs dir: " ++ projDir proj
+  e' <- distillTask distillCtr maxDistillLemmas env p proj e
+  if e == e'
+    then hPutStrLn stderr "[distill] no lemmas applied; driving original task"
+    else hPutStrLn stderr $ "[distill] driving rewritten task: " ++ showSLL e'
   let w = guardWhistles whistleCount (mkVerifiedWhistle counter env p proj)
-  tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e
+  tree <- bftIO w (addPropagation $ driveMachine p) nameSupply [] e'
   let result = residuate $ simplify $ foldTree tree
   teardownProject proj
   return result

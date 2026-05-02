@@ -24,6 +24,7 @@ library
       LeanEmbed
       LeanCheck
       LeanProver
+      Distillation
   hs-source-dirs:
       src
   build-depends:

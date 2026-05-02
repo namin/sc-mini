@@ -212,16 +212,132 @@ in `e ∪ e'`, we treat the conjecture as ill-formed and fall back. (In
 practice every whistle-target is a call, so each free var has at least
 one typing constraint.)
 
+## Distillation
+
+The perf harness (`bench/Perf.hs`) showed that the LLM's
+let-introduction proposals preserve operation count: the residual is
+*compact and correct*, but not faster than the original. To beat
+classical (which gets up to 24x speedups by aggressive unfolding) the
+LLM needs to propose **eureka lemmas** — equalities like
+`forall n, gHalf(gDouble(n)) = n` that change which expressions are
+*equivalent*, not just how they're structured. Validation (manually
+distilling `half-of-double` with one Lean-verified lemma) gave a 5x
+speedup with a 7x smaller residual; this section covers the design of
+turning that into an automated pipeline.
+
+### Lemma data model
+
+```haskell
+data Lemma = Lemma
+  { lemmaName    :: Name           -- printable, e.g. "lemma_1"
+  , lemmaForall  :: [(Name, Type)] -- universally-quantified vars + types
+  , lemmaLhs     :: Expr           -- pattern: SLL expression with lemmaForall vars free
+  , lemmaRhs     :: Expr           -- replacement, same free vars
+  , lemmaProof   :: String         -- Lean `by …` block
+  }
+```
+
+Both `lemmaLhs` and `lemmaRhs` are SLL expressions: lemmas live in the
+SLL world and rewriting produces SLL, so the supercompiler can drive
+the rewritten configuration normally afterward. The proof is Lean.
+
+### Where lemmas fire: pre-pass
+
+The validation experiment ran the rewrite *before* the supercompiler
+started driving — and that was already enough to close the gap to
+classical. v1 keeps that shape: distillation is a pre-pass on the
+input task, not woven into `bftIO`.
+
+```
+supercompileIOWithTypes env (e, p):
+   ┌───────────────────────────────────────────────┐
+   │ distillation pre-pass                         │
+   │   for i in 1..N:                              │
+   │     lemma <- proposeLemma env p e_i           │
+   │     if verifyLemma env p lemma == Ok:         │
+   │       e_{i+1} <- rewrite lemma e_i            │
+   │     else: stop                                │
+   └───────────────┬───────────────────────────────┘
+                   ↓
+              bftIO on e_N
+```
+
+The pre-pass shape keeps distillation fully decoupled from the
+supercompiler's drive/whistle/fold mechanics. Intra-supercompile
+triggering (e.g. "ask for a lemma when HE fires repeatedly without
+making progress") is more sophisticated but has more knobs and more
+ways to mis-fire — defer until/unless we see a benchmark that needs it.
+
+### Prompt strategy
+
+Broad rather than targeted: "given this program and this expression,
+propose an equation that simplifies it." The LLM is told the lemma
+must be (a) universally quantified over typed variables, (b) have an
+SLL LHS that pattern-matches a subexpression of the input, (c) have
+an RHS that's also SLL, and (d) come with a Lean proof.
+
+A targeted variant ("propose a lemma whose LHS rewrites *this exact
+subexpression*") would be cleaner but assumes we know which
+subexpression to focus on. v1 leaves that to the LLM.
+
+### Pattern matching
+
+Lemma application is *unification* (one-sided: lemma LHS is a pattern
+with `lemmaForall` variables; the candidate is a closed subexpression
+of the input). This is **not** `msg`/anti-unification — we want
+"does the candidate match the pattern" with a substitution, not the
+common generalization of two terms.
+
+Algorithm: walk the input top-down; at each subexpression `s`, try to
+unify `lemmaLhs ~ s` treating `lemmaForall` names as metavariables.
+If unification succeeds with substitution σ, replace `s` with
+`lemmaRhs[σ]`. Recurse on children otherwise.
+
+### Fixed-point iteration
+
+After each successful lemma application, the rewritten expression is
+the new "input" — and the LLM may now spot another lemma that helps.
+Iterate up to a budget (e.g. 3 lemmas) or until the LLM declines to
+propose more.
+
+### Verification
+
+Same pipeline as generalization conjectures: render the lemma to a
+`Conjecture_<n>.lean` file, run `lake env lean`, accept on exit 0.
+The crucial difference: lemmas usually need induction, so bare
+`simp_all` won't discharge them — the LLM-supplied proof body is what
+gets verified. Stage 2 of the two-stage strategy finally does
+substantive work.
+
+If the LLM's proof fails to verify, the lemma is rejected. No
+classical-style fallback applies (lemmas are LLM-territory by
+definition); we just don't apply that lemma.
+
+### What v1 doesn't do
+
+- No persistent lemma library across supercompile runs.
+- No targeted ("lemma about this subexpression") prompting.
+- No lemma *chaining* (using a verified lemma as a hypothesis when
+  proving a subsequent one). Each lemma proves against the program's
+  base equations only.
+- No intra-supercompile triggering (mid-`bftIO` lemma proposal).
+- No automatic detection of "did distillation actually help" —
+  benchmarks measure step counts post-hoc, but the supercompiler
+  doesn't decide whether to keep a lemma based on residual quality.
+
 ## Module layout
 
-Three new Haskell modules:
+Four new Haskell modules:
 
 - `LeanEmbed.hs` — pure rendering.
-  - `embedProgram   :: TypeEnv -> Program -> String`
-  - `embedExpr      :: TypeEnv -> Expr -> String`
+  - `embedProgram    :: TypeEnv -> Program -> String`
+  - `embedExpr       :: TypeEnv -> Expr -> String`
   - `embedConjecture :: TypeEnv -> Program -> Expr -> Expr -> String -> String`
     last `String` is the proof body (auto-tactic or LLM-supplied);
     returns the full `Conjecture.lean` source (with `import Program`).
+  - `embedLemma      :: TypeEnv -> Program -> Lemma -> String`
+    renders a `Lemma` as a `Conjecture.lean` file with the LLM's
+    `by …` block.
 - `LeanCheck.hs` — IO oracle. Owns one `<runDir>/proofs/` per run.
   - `data LeanProject` — opaque handle: run dir, conjecture counter.
   - `data Verdict = Ok | Failed { stderr :: String }`
@@ -235,20 +351,34 @@ Three new Haskell modules:
     run dir on success.
 - `LeanProver.hs` — the two-stage strategy.
   - `autoTactic   :: TypeEnv -> Program -> String` — emits the canned
-    `by intros; simp_all [<defs>]` block for the given program.
+    `by intros; simp_all` block.
   - `tryAuto      :: TypeEnv -> Program -> Expr -> Expr -> IO Bool` —
     runs `LeanCheck.verify` with the auto tactic.
+- `Distillation.hs` — lemma proposal, verification, rewriting.
+  - `data Lemma` (above).
+  - `proposeLemma   :: TypeEnv -> Program -> Expr -> IO (Maybe Lemma)`
+    asks Bedrock for a candidate lemma, parses the response.
+  - `verifyLemma    :: TypeEnv -> Program -> Lemma -> LeanProject -> IO Bool`
+    renders + checks via `LeanCheck.verify`.
+  - `rewrite        :: Lemma -> Expr -> Maybe Expr`
+    pattern-matches `lemmaLhs` against subexpressions of the input;
+    returns `Just` rewritten expression on first match, `Nothing` if
+    the lemma doesn't apply anywhere.
+  - `distillTask    :: TypeEnv -> Program -> Expr -> LeanProject -> IO Expr`
+    runs the pre-pass: propose, verify, rewrite, repeat ≤ N times.
 
-Flow in `LLMSupercompiler.hs`:
+Flow in `LLMSupercompiler.supercompileIOWithTypes`:
 
 ```
-whistle fires
-  → LLM proposes e' (SLL only)
-  → tryAuto
-       ↳ True   → accept
-       ↳ False  → prompt LLM for proof body, ≤ N times
-                    ↳ accept on first verifying body
-                    ↳ on N failures → classicalGeneralize
+setupProject env p
+  → distillTask env p e proj    (pre-pass: rewrites e using verified lemmas)
+  → bftIO with verified-whistle on e'
+       (per whistle:
+         LLM proposes e''
+         tryAuto
+           ↳ Ok    → accept
+           ↳ Fail  → LLM proves; verify; on fail → classicalGeneralize)
+  → residuate ∘ simplify ∘ foldTree
 ```
 
 ## What v1 deliberately doesn't do

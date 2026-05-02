@@ -170,25 +170,24 @@ residual (HE whistle, `supercompileIOWithTypes`) — then runs each
 through `intC` (the counting interpreter) on a series of concrete
 inputs and reports step counts and ratios.
 
-Sample output:
+Sample output (with distillation enabled):
 
 ```
-==> even-square
+==> even-square    (distillation: lemma proposed but proof failed)
     sizes: orig=11  classical=328  llm=22
     input    |  orig  |  class |   llm  | cls/orig |  llm/orig | llm/cls
     ---------+--------+--------+--------+----------+-----------+--------
-    0        |      3 |      1 |      1 |    0.33  |    0.33   |   1.00
     12       |    315 |     13 |    314 |    0.04  |    1.00   |  24.15
 
-==> add-assoc
-    sizes: orig=11  classical=4  llm=8
-    10       |     32 |     22 |     32 |    0.69  |    1.00   |   1.45
+==> add-assoc      (distillation: associativity lemma applied)
+    sizes: orig=11  classical=4  llm=4
+    10       |     32 |     22 |     22 |    0.69  |    0.69   |   1.00
 
-==> half-of-double
-    sizes: orig=14  classical=2  llm=14
-    12       |     64 |     13 |     64 |    0.20  |    1.00   |   4.92
+==> half-of-double (distillation: gHalf∘gDouble = id lemma applied)
+    sizes: orig=14  classical=2  llm=2
+    12       |     64 |     13 |     13 |    0.20  |    0.20   |   1.00
 
-==> kmp-aa
+==> kmp-aa         (distillation: no matching lemma found)
     sizes: orig=15  classical=9  llm=37
     ABABAA   |     46 |     15 |     39 |    0.33  |    0.85   |   2.60
 ```
@@ -199,32 +198,74 @@ show as `*** VALUE MISMATCH ***` next to the row.
 
 ### What the numbers say
 
-The data is sobering. Across all four benchmarks, **the
-LLM-supercompiled residuals do not reduce step counts compared to the
-original program**. Classical does — sometimes dramatically (24x on
-even-square at x=12, 5x on half-of-double).
+When distillation succeeds, the LLM path matches classical's
+performance with a smaller residual. When distillation can't find or
+verify a lemma, the path falls back to whistle-time generalizations
+and produces a compact, correct, machine-checked residual — but with
+the same step count as the original program.
 
-The pattern: classical (with size-bound whistle) unfolds aggressively
-and produces large residuals (328 functions on even-square) that are
-much faster. The LLM path (with HE whistle) produces small residuals
-(22 functions on even-square) that compute the same answers in the
-same number of steps as the original.
+Distillation succeeds on `add-assoc` (LLM proposes `gAdd(gAdd(x,y),z) =
+gAdd(x, gAdd(y,z))`, Lean verifies; residual drops to 4 functions and
+matches classical at 22 steps for k=10) and on `half-of-double` (LLM
+proposes `forall n, gHalf(gDouble(n)) = n`, Lean verifies; residual
+drops to 2 functions matching classical at 13 steps for n=12, a 5x
+speedup over the no-distillation LLM path).
 
-This isn't because the LLM is failing — every accepted proposal is
-Lean-checked and semantically correct. It's because the
-*kind* of transformation the LLM proposes is structural
-(let-introduction over subexpressions), and structural rewrites
-preserve operation count. The kind of transformation that would
-actually speed things up — e.g., recognizing that `gEven(fSqr(x))`
-has the same parity as `gEven(x)` — is a *eureka lemma*, an insight
-that the supercompiler can't currently ask for and that "extract
-this subexpression into a let" doesn't capture.
+It doesn't succeed on `even-square` (the right lemma is
+`gEven(fSqr(x)) = gEven(x)` but its proof needs sub-lemmas about
+`gMult`'s parity — single-shot induction can't close it; lemma
+chaining is the v2 fix) or on `kmp-aa` (the LLM's plausible lemmas
+don't pattern-match the input expression's actual shape; targeted
+prompting would help).
 
 The empirical answer to "is the LLM-augmented supercompiler faster
-than classical": **not yet**. The LLM path is currently producing
-*compact, correct, machine-checked* residuals — but the speedup
-story requires the next step (distillation; LLM proposes lemmas,
-Lean proves them, residuals are rewritten using them).
+than classical": **on the benchmarks where distillation succeeds, yes
+— it matches classical exactly, with a smaller residual. On the
+others, it produces a compact, correct, machine-checked residual that
+isn't faster than the original program**. Without distillation, the
+LLM path is "small but slow" everywhere. With distillation, it's
+"small and fast" where the LLM can find a good lemma.
+
+## Distillation pre-pass
+
+Before driving starts, `supercompileIOWithTypes` runs a distillation
+pre-pass (see `src/Distillation.hs` and the "Distillation" section of
+`DESIGN_LEAN.md`):
+
+1. Ask the LLM for a candidate lemma about the program + input
+   expression. The lemma is `forall <vars>, lhs = rhs` plus a Lean
+   proof body.
+2. Render the lemma as a Lean theorem (via `embedLemma`) and verify
+   via the existing `LeanCheck.verify`. Lemmas usually need induction,
+   so the LLM-supplied proof body is what gets checked — this is
+   where the LLM-as-prover stage 2 finally does substantive work.
+3. If verified, pattern-match the lemma's LHS against subexpressions
+   of the input (one-sided unifier; lemma's bound vars are
+   metavariables) and rewrite to RHS.
+4. Repeat up to `maxDistillLemmas = 3` LLM calls per supercompile.
+
+A typical successful trace:
+
+```
+[distill] requesting lemma #1 for: gEq(gHalf(gDouble(n)), n)
+[distill] response: FORALL: n : Nat
+LHS: gHalf(gDouble(n))
+RHS: n
+PROOF:
+by induction n with | Z => rfl | S x ih => simp [gDouble, gHalf, gHalf1]; exact ih
+
+[distill] parsed: gHalf(gDouble(n)) = n
+[distill] lemma verified by Lean
+[distill] applied: gEq(n, n)
+[distill] driving rewritten task: gEq(n, n)
+```
+
+Failure modes (all graceful — fall through to driving the original
+expression):
+- `lemma rejected: <lean error>` — Lean refused the proof
+- `parse failed (or NONE)` — LLM declined or sent malformed output
+- `lemma verified but doesn't match e` — proof was good but the LHS
+  doesn't appear in the input expression
 
 ## Benchmarks
 

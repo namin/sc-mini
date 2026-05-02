@@ -165,42 +165,78 @@ trust the LLM.
   LLM-supercompiled) and reports step counts plus speedup ratios. Also
   serves as a correctness check (asserts all three return the same
   value).
+- Distillation pre-pass (`Distillation.hs`): before driving begins,
+  the LLM is asked for one or more eureka lemmas about the program +
+  input expression. Each candidate is verified via the existing
+  `LeanCheck.verify` pipeline (induction proofs go through here, not
+  through the auto-prove block). Verified lemmas are pattern-matched
+  against subexpressions of the input via a one-sided unifier
+  (lemma's quantified vars as metavariables); on a match, the input
+  is rewritten with the lemma's RHS. Iterates up to a small budget
+  (`maxDistillLemmas = 3` LLM calls per supercompile).
 
-## Empirical finding from the perf harness
+## Empirical findings from the perf harness
 
-Across the four benchmarks, **LLM-supercompiled residuals do not
-reduce step counts vs. the original program**, while
-classical-supercompiled residuals do (up to 24x faster on
-`even-square` at x=12, ~5x on `half-of-double`). All three variants
-compute the same values, so the LLM path is correct — it just isn't
-faster.
+The perf harness (`stack exec llm-perf`) compares the original program,
+the classical-supercompiled residual, and the LLM-supercompiled
+residual on concrete inputs.
 
-The reason is structural: the LLM currently proposes *let-
-introductions* (extract a subexpression and bind it to a fresh var).
-Those preserve operation count. The transformations that actually
-speed things up (e.g. "`gEven(fSqr(x))` has the same parity as
-`gEven(x)`") are *eureka lemmas* — assertions about program behaviour
-that need a separate proof, not just a rename. Classical
-supercompilation gets some speedups by aggressively unfolding (the
-~24x on even-square came with a 328-function residual); the LLM with
-HE produces compact residuals (22 functions) but at the cost of
-preserving the original program's runtime shape.
+**Without distillation** the LLM path produced compact, correct,
+machine-checked residuals — but with the *same step count as the
+original program*, while classical achieved up to 24x speedup. The
+gap was structural: the LLM proposes let-introductions (which
+preserve operation count); classical achieves speedups by aggressive
+unfolding (at the cost of large residuals: 328 functions on
+even-square).
 
-This validates the original PLAN framing: the LLM is only useful
-when it goes beyond what classical can do — and "let-introduction
-under HE" isn't beyond classical. The next step is therefore
-distillation: ask the LLM for actual lemmas, prove them in Lean,
-rewrite the program using them.
+**With distillation enabled** the LLM finds eureka lemmas on two of
+the four benchmarks, and Lean verifies their proofs. The result on
+those two:
+
+| Benchmark        | Without distillation        | With distillation        |
+|------------------|-----------------------------|--------------------------|
+| add-assoc        | 8 fns, k=10: 32 steps       | **4 fns, 22 steps**      |
+| half-of-double   | 14 fns, n=12: 64 steps      | **2 fns, 13 steps**      |
+
+Both match classical's performance exactly, with classical-or-smaller
+residuals. The half-of-double case is the cleanest example: the LLM
+proposed `forall n, gHalf(gDouble(n)) = n`, Lean verified the
+induction proof, the rewriter applied it to turn
+`gEq(gHalf(gDouble(n)), n)` into `gEq(n, n)`, and the supercompiler
+drove the simplified expression to a 2-function residual.
+
+**Distillation didn't help on the other two benchmarks**:
+
+- `even-square`: the LLM proposed the right lemma
+  (`gEven(fSqr(x)) = gEven(x)`) but couldn't prove it in one shot.
+  The proof needs reasoning about `gMult`'s parity properties — a
+  chain of sub-lemmas. Lemma chaining (using already-verified lemmas
+  as simp/rewrite hypotheses when proving subsequent ones) is a v2
+  improvement.
+- `kmp-aa`: the LLM proposed structurally plausible lemmas, but they
+  didn't pattern-match the input expression's actual shape. A
+  targeted prompt ("propose a lemma whose LHS is a subexpression of
+  this exact term") would help.
+
+The empirical answer to "is the LLM-augmented supercompiler
+beneficial": **yes, on benchmarks where distillation succeeds**.
+When the LLM proposes a useful lemma and Lean verifies it, the
+resulting residual matches classical's performance with a smaller
+codebase. When the LLM can't prove the right lemma, the system
+gracefully falls back and produces the same compact-but-not-faster
+residual we had before.
 
 **Not yet:**
-1. Distillation experiments. The natural next direction given the
-   perf finding above. Concretely: when the supercompiler gets stuck
-   (HE fires repeatedly without producing a foldable shape, or the
-   residual matches the original in step count), prompt the LLM for
-   a *lemma* — e.g. `forall x, gEven(fSqr(x)) = gEven(x)` — plus a
-   Lean proof. If Lean accepts, register the lemma and rewrite
-   matching subexpressions. This is the move that gets the LLM
-   beyond what classical can do.
+1. Distillation v2 — concrete improvements informed by the v1 trace:
+   - **Lemma chaining**: keep verified lemmas as hypotheses or simp
+     rules in subsequent proof attempts. Would unlock `even-square`.
+   - **Targeted prompting**: ask for a lemma about a specific
+     subexpression rather than "anything useful". Would help kmp-aa.
+   - **Oscillation detection**: stop the iteration loop early if the
+     same lemma is proposed in alternating directions (add-assoc
+     traces show A→B→A→B; the trail is correct but wasteful).
+   - **Persistent lemma library**: cache verified lemmas across
+     supercompile runs so each program "learns" over time.
 2. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
    path with an Ok verdict yet across the four benchmarks. Real
    induction-needing conjectures (e.g. `gAdd x Z ≡ x`) would benefit

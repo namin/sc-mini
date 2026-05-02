@@ -2,6 +2,7 @@ module LeanEmbed
   ( embedProgram
   , embedExpr
   , embedConjecture
+  , embedLemma
   ) where
 
 import Data
@@ -256,4 +257,25 @@ embedConjecture env _ e e' proof =
        , ""
        , "theorem gen_ok : " ++ forall_ ++ lhs ++ " = " ++ rhs ++ " :="
        , "  " ++ proof
+       ]
+
+-- Lemma.lean: imports the prebuilt Program module, then asserts a
+-- universally-quantified equality under the LLM-supplied proof body.
+-- Binders go *before* the colon (Lean's parameter form) rather than as
+-- `forall`-quantified names after — Lean only puts the parameter form
+-- in scope inside the proof body, so the LLM can write `induction n`
+-- directly without a leading `intro n`.
+embedLemma :: TypeEnv -> Program -> Lemma -> String
+embedLemma _ _ lem =
+  let binders = if null (lemmaForall lem)
+                  then ""
+                  else " " ++ unwords [typedBinder v t | (v, t) <- lemmaForall lem]
+      lhs = renderExpr (lemmaLhs lem)
+      rhs = renderExpr (lemmaRhs lem)
+  in unlines
+       [ "import Program"
+       , ""
+       , "theorem " ++ lemmaName lem ++ binders ++ " : "
+           ++ lhs ++ " = " ++ rhs ++ " :="
+       , "  " ++ lemmaProof lem
        ]

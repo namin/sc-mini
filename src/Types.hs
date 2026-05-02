@@ -1,6 +1,6 @@
 module Types where
 
-import Data (Name)
+import Data (Name, Expr)
 
 -- Monomorphic type expressions. SLL is first-order with no polymorphism,
 -- so a type is just a nullary type constructor.
@@ -60,3 +60,16 @@ ctrFields cn env = go (typeDefs env)
       case [ts | CtrDef c ts <- ctrs, c == cn] of
         (ts:_) -> Just ts
         []     -> go ds
+
+-- A distillation lemma: forall <forallVars>, lhs = rhs, with a Lean
+-- proof body. Both sides are SLL expressions; `forallVars` are the
+-- universally-quantified pattern variables (and their declared types
+-- for Lean's binder). The proof is whatever the LLM wrote, including
+-- the leading `by`.
+data Lemma = Lemma
+  { lemmaName   :: Name           -- printable identifier, e.g. "lemma_1"
+  , lemmaForall :: [(Name, Type)] -- bound vars + types
+  , lemmaLhs    :: Expr           -- pattern (free vars are lemmaForall names)
+  , lemmaRhs    :: Expr           -- replacement, same free vars
+  , lemmaProof  :: String         -- Lean `by …` block (verbatim)
+  } deriving (Eq)
