@@ -94,13 +94,25 @@ bftPure d ns hist t = case d ns t of
 -- generalized expression to use when HE fires; this layer is purely
 -- structural and doesn't know about LLM or Lean.
 --
--- After a generalization, we keep the full history (including the
--- matched ancestor) — same as bftPure. The generalized expr is a Let
--- (not a call), so the whistle doesn't immediately re-fire; later, when
--- driving the Let's subterms, the preserved ancestor lets foldTree find
--- back-edges. Removing the ancestor (as the original bftIO did) breaks
--- folding for any subterm that should match it.
+-- We keep full history across whistles — same as bftPure. The
+-- generalized expr is a Let (not a call), so the whistle doesn't
+-- immediately re-fire; preserving ancestors lets back-edge detection
+-- find them later.
+--
+-- Crucially, we detect back-edges (renamings of ancestors) inline,
+-- before either the whistle or the drive step. This is what foldTree
+-- does post-hoc on bftPure's lazy tree, but bftIO is in IO and eager,
+-- so the tree must be finite by construction. As soon as the current
+-- node is a renaming of an ancestor we emit a Fold and stop. The
+-- placeholder `Node anc Stop` is fine because Generator.res only reads
+-- the Conf (`base`) from the Fold, not the rest of the node.
 bftIO :: Whistle -> Machine Conf -> NameSupply -> [Conf] -> Conf -> IO (Tree Conf)
+bftIO _ _ _ hist e
+  | Just (anc, ren) <- findFold hist e = do
+      hPutStrLn stderr "  [fold] back-edge to ancestor"
+      hPutStrLn stderr $ "    ancestor: " ++ showSLL anc
+      hPutStrLn stderr $ "    current:  " ++ showSLL e
+      return $ Node e (Fold (Node anc Stop) ren)
 bftIO w d (n:ns) hist e
   | whistleCandidate e, Just anc <- findEmbedding hist e = do
       hPutStrLn stderr "  [whistle] HE detected"
@@ -180,6 +192,15 @@ findEmbedding [] _ = Nothing
 findEmbedding (a:as) e
   | homeEmbed a e = Just a
   | otherwise = findEmbedding as e
+
+-- Find the most recent ancestor of which `e` is a renaming (same shape,
+-- consistent variable mapping). Restricted to call expressions, matching
+-- `tieKnot`'s post-hoc check in Folding.hs.
+findFold :: [Conf] -> Conf -> Maybe (Conf, Renaming)
+findFold _ e | not (isCall e) = Nothing
+findFold hist e = case [(a, r) | a <- hist, Just r <- [renaming a e]] of
+  []    -> Nothing
+  (x:_) -> Just x
 
 -- Ask the LLM to generalize given the ancestor/descendant pair. On any
 -- failure (network, parse, malformed reply) we fall through to classical
