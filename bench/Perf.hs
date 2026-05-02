@@ -49,6 +49,15 @@ lsym :: [Sym] -> Expr
 lsym []     = Ctr "Nil" []
 lsym (s:ss) = Ctr "Cons" [Ctr (show s) [], lsym ss]
 
+-- Lists of Nat for prog5.
+nat :: Int -> Expr
+nat 0 = Ctr "Z" []
+nat n = Ctr "S" [nat (n - 1)]
+
+lnat :: [Int] -> Expr
+lnat []     = Ctr "Nil" []
+lnat (x:xs) = Ctr "Cons" [nat x, lnat xs]
+
 -- Test cases per benchmark. Inputs scale up so we can see whether the
 -- residual gets faster as the input grows (a constant-factor speedup
 -- shows up everywhere; an asymptotic speedup widens with input size).
@@ -86,10 +95,24 @@ benchmarks =
       "add-commute"
       ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
       prog3Types
-      -- Use distinct x, y so the equality is a real test (not trivially x=x).
       [ (show k ++ "/" ++ show (k+1),
          [("x", peano k), ("y", peano (k+1))])
       | k <- [0, 1, 2, 4, 6, 8, 10]
+      ]
+  , PerfBench
+      "reverse-involution"
+      ([expr|gReverse(gReverse(xs))|], prog5)
+      prog5Types
+      [ ("len" ++ show n, [("xs", lnat (take n [0..]))])
+      | n <- [0, 1, 2, 3, 5, 7, 10]
+      ]
+  , PerfBench
+      "length-distributes"
+      ([expr|gLength(gAppend(xs, ys))|], prog5)
+      prog5Types
+      [ (show m ++ "+" ++ show n,
+         [("xs", lnat (take m [0..])), ("ys", lnat (take n [0..]))])
+      | (m, n) <- [(0,0), (1,1), (2,3), (3,2), (5,5), (7,3), (10,10)]
       ]
   ]
 

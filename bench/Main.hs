@@ -65,6 +65,16 @@ benchmarks =
       ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
       prog3Types
       (0, 40)
+  , Benchmark
+      "reverse-involution"
+      ([expr|gReverse(gReverse(xs))|], prog5)
+      prog5Types
+      (0, 40)
+  , Benchmark
+      "length-distributes"
+      ([expr|gLength(gAppend(xs, ys))|], prog5)
+      prog5Types
+      (0, 40)
   ]
 
 data Stats = Stats

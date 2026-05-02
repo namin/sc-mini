@@ -156,6 +156,40 @@ prog4 = [prog|
   fB(x) = fB(S(x));
 |]
 
+-- A list module: lists of Nat with append, reverse, length, sum.
+-- Larger surface than the existing demo programs (5 g-functions on
+-- two types), with classic functor/monoid identities the LLM can
+-- target as eureka lemmas.
+prog5 :: Program
+prog5 = [prog|
+  gAdd(Z(), y) = y;
+  gAdd(S(x), y) = S(gAdd(x, y));
+  gAppend(Nil(), ys) = ys;
+  gAppend(Cons(x, xs), ys) = Cons(x, gAppend(xs, ys));
+  gReverse(Nil()) = Nil();
+  gReverse(Cons(x, xs)) = gAppend(gReverse(xs), Cons(x, Nil()));
+  gLength(Nil()) = Z();
+  gLength(Cons(x, xs)) = S(gLength(xs));
+  gSum(Nil()) = Z();
+  gSum(Cons(x, xs)) = gAdd(x, gSum(xs));
+|]
+
+prog5Types :: TypeEnv
+prog5Types = TypeEnv
+  { typeDefs =
+      [ DataDef "Nat"  [CtrDef "Z" [], CtrDef "S" [TyCon "Nat"]]
+      , DataDef "LNat" [CtrDef "Nil" [], CtrDef "Cons" [TyCon "Nat", TyCon "LNat"]]
+      ]
+  , funSigs =
+      [ ("gAdd",     ([TyCon "Nat", TyCon "Nat"], TyCon "Nat"))
+      , ("gAppend",  ([TyCon "LNat", TyCon "LNat"], TyCon "LNat"))
+      , ("gReverse", ([TyCon "LNat"], TyCon "LNat"))
+      , ("gLength",  ([TyCon "LNat"], TyCon "Nat"))
+      , ("gSum",     ([TyCon "LNat"], TyCon "Nat"))
+      ]
+  , funPartial = []
+  }
+
 -- counting steps of interpreter
 demo01 =
   intC prog1 [expr|gEven(fSqr(S(S(Z()))))|]
