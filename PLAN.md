@@ -179,17 +179,27 @@ trust the LLM.
   `Conjecture_<n>.lean` files (with their already-checked proofs) so
   Lean recognizes them as available rewrite rules, and (b) listed in
   the prompt to the LLM so it can reference them by name in `rw [...]`
-  / `simp [...]` invocations. The prompt also encourages
-  decomposition: if the lemma the LLM ideally wants to state needs a
-  sub-lemma, propose the sub-lemma this turn, build the chain.
+  / `simp [...]` invocations.
 - Proof retry on verification failure: when Lean rejects an
   LLM-supplied proof, the system reprompts the LLM with the failure
   output and asks for a fixed proof of the *same* lemma (preserving
   forall/lhs/rhs). Up to `distillProofRetries = 1` retry per lemma,
-  costing one Bedrock call. Addresses the LLM-non-determinism
-  observed in the chaining-only run, where the LLM sometimes wrote
-  `simp only [...]` (failed) instead of `simp [...]` (worked) for the
-  same target lemma.
+  costing one Bedrock call.
+- Rejects tracking + conditional guidance: rejected proposals (with
+  the Lean error message) accumulate alongside verified ones, and
+  appear in subsequent prompts so the LLM doesn't re-propose the
+  same broken lemma. The "you may propose helper sub-lemmas" license
+  is conditional on whether previous attempts have failed: the first
+  iteration prompt is strict on-candidate; after a rejection, the
+  prompt opens up to off-candidate helpers (which then become
+  available as `rw` rules in the chain).
+- Smarter rewriter modulo program unfolding: when a verified lemma's
+  LHS doesn't syntactically match a subexpression of the input, the
+  rewriter tries one step of f-call/g-call unfolding before giving
+  up. So a lemma about `gMult(x, x)` will apply to a subexpression
+  `fSqr(x)` because `fSqr(x) = gMult(x, x)` unfolds into shape. The
+  rewrite still replaces the original (pre-unfold) subexpression,
+  not the unfolded form.
 
 ## Empirical findings from the perf harness
 
@@ -208,93 +218,93 @@ even-square).
 **With distillation enabled (basic)** the LLM finds eureka lemmas on
 two of the four benchmarks, and Lean verifies their proofs.
 
-**With lemma chaining + proof retry** added on top, and after a
-prompt-cleanup pass that removed a self-contradicting "propose
-sub-lemmas this turn" instruction, distillation now matches or beats
-classical on three of four benchmarks:
+After all five mechanisms (chaining, retry, rejects tracking,
+conditional guidance, smarter rewriter), the system's behavior on the
+five-benchmark suite is:
 
-| Benchmark        | No distillation        | Distillation v3 (current)        |
-|------------------|------------------------|----------------------------------|
-| even-square      | 22 fns, n=12: 314 steps| **4 fns, 13 steps**              |
-| add-assoc        | 8 fns, k=10: 32 steps  | 4 fns, 22 steps                  |
-| half-of-double   | 14 fns, n=12: 64 steps | **0 fns, 0 steps**               |
-| kmp-aa           | 37 fns                 | 37 fns (no help)                 |
+| Benchmark        | Classical    | LLM (typical run)         |
+|------------------|--------------|---------------------------|
+| even-square      | 328 fns / 13 steps | **4 fns / 13 steps** (sometimes 22 fns — see variance below) |
+| add-assoc        | 4 / 22       | 4 / 22 (matches)          |
+| half-of-double   | 2 / 13       | **0 / 0** (beats classical) |
+| kmp-aa           | 9 / —        | 37 / — (out of scope)    |
+| add-commute      | 207 / 25     | 14 / 67 (matches original) |
 
-For comparison classical's residuals are 328, 4, 2, and 9 functions
-respectively. The LLM path is now smaller than classical on three of
-four (only `kmp-aa` is bigger), and on `half-of-double` it's
-strictly faster too.
-
-The cleanest examples:
+The cleanest wins:
 
 - **half-of-double**: LLM chains `gHalf(gDouble(n)) = n` and
-  `gEq(n, n) = True()` (the second proof needed retry to succeed)
-  to reduce the input to a constant. Zero residual functions, zero
-  step count.
-- **even-square**: LLM proposes `forall x, gEven(fSqr(x)) = gEven(x)`,
+  `gEq(n, n) = True()` to reduce the input to a constant. Zero
+  residual functions, zero step count.
+- **even-square** (when it works): LLM proposes
+  `gEven(fSqr(x)) = gEven(x)` (or the more general
+  `gEven(gMult(x, x)) = gEven(x)`, handled by the smarter rewriter),
   Lean verifies, the rewriter applies it, supercompiler drives
-  `gEven(x)` to 4 functions. *Same speed as classical, 82x smaller
-  residual* (classical's brute-force unfolding hits 328 functions
-  for the same 13-step output).
+  `gEven(x)` to 4 functions. Same speed as classical, 82x smaller
+  residual.
 
-These are the kind of results classical can't reach: classical can't
-know that "the parity of x squared equals the parity of x" or that
-"halving twice the value gives the value back" — those are facts
-about the equivalence relation, not the program structure. Only a
-Lean-checked lemma puts them on the table.
+The structural failures:
 
-**The remaining holdout, `kmp-aa`, is structurally different**: the
-input `fMatch(Cons(A(), Cons(A(), Nil())), s)` has only one call
-subexpression (`fMatch` itself), so there's nowhere to drill down.
-The LLM keeps trying to write equations relating `gN`/`gM` to
-`fMatch`, but those have wrong-side LHS (gN/gM, not fMatch) and
-don't match the only candidate. Different problem from the other
-three.
+- **kmp-aa**: input has only one call subexpression (`fMatch` itself).
+  No useful semantic lemma exists at the candidate level. Out of
+  scope for distillation as currently formulated.
+- **add-commute**: LLM correctly identifies the chain it needs (sub-
+  lemmas `gAdd(x, Z) = x` and `gAdd(x, S(y)) = S(gAdd(x, y))`, then
+  commutativity itself), and the rejects-tracking nudges it toward
+  helpers after direct fails. The two helper sub-lemmas verify
+  cleanly; commutativity itself doesn't — the LLM's Lean proof
+  attempts use invalid tactics or fail in ways even a retry doesn't
+  catch.
 
-**The breakthrough was prompt simplification, not capability.** An
-earlier prompt told the LLM "propose sub-lemmas this turn if you can't
-prove the main one in one shot" — a permission that, in tension with
-the implicit "your lemma must apply to the input" constraint,
-encouraged the LLM to propose useful-but-non-applicable lemmas. With
-that instruction removed and the constraint stated unambiguously, the
-LLM started proposing on-target lemmas first try.
+## The variance floor
+
+Even-square outcomes vary across runs because the LLM picks between
+equivalent lemma forms (e.g. `gEven(fSqr(x)) = gEven(x)` vs
+`gEven(gMult(x, x)) = gEven(x)`), and **its proofs use invalid Lean
+tactics often enough that a single retry isn't always sufficient**.
+Observed proof failures across runs include:
+
+- `induction n with | zero => ... | succ n ih => ...` — Lean stdlib
+  `Nat` constructors used instead of our `Nat'`'s `Z`/`S`.
+- `simp only [...]` where `simp [...]` (without `only`) was needed
+  to reduce the goal far enough.
+- `by unfolding` — not a real Lean tactic (the LLM may be conflating
+  `unfold` with mathlib's `unfolding` notation).
+- `True'` instead of `True` — over-application of the prime
+  convention used for type names.
+
+These are LLM-side errors that more architecture wouldn't help.
+Multi-sample proposals (have the LLM produce N candidate proofs per
+turn and verify each) would damp the variance at the cost of more
+Bedrock calls.
 
 ## How the pieces interact
 
-For `half-of-double`, all three pieces (chaining, retry, clean
-prompt) are necessary:
+The five mechanisms compose:
 
-- Without retry: the second lemma (`gEq(n, n) = True()`) fails its
-  first proof attempt and gets discarded; the chain never finishes.
-- Without chaining: the working `gEq(n, n) = True()` proof would
-  have nothing to reduce the input to `gEq(n, n)` first.
-- Without the prompt cleanup: earlier runs with the
-  decompose-into-sub-lemmas instruction had the LLM proposing
-  off-target lemmas instead of `gHalf(gDouble(n)) = n` directly, and
-  the chain never started.
+- **Chaining + retry** unlocks `half-of-double` (chain of two
+  inductive lemmas, second proof fails first try and succeeds on
+  retry).
+- **Conditional guidance** prevents the LLM from drifting to
+  off-candidate sub-lemmas when a direct lemma is available
+  (`even-square`, `add-assoc`).
+- **Rejects tracking** lets the LLM see its own past failures and
+  adapt — observed clearly on `add-commute`, where the LLM's third
+  iteration explicitly says "the previous attempt failed because it
+  tried to prove it directly with `simp`. Let me propose a helper".
+- **Smarter rewriter** (modulo unfolding) absorbs the LLM's choice
+  of lemma form: `gEven(gMult(x, x)) = gEven(x)` and
+  `gEven(fSqr(x)) = gEven(x)` are both useful for the same input
+  whereas previously only the latter applied.
 
-Budget-wise: 3 proposals × 2 attempts per proposal = 6 Bedrock calls
-max per supercompile. In practice half-of-double used 5 (2 clean
-first-tries + 1 retry), which is modest given the result.
-
-`kmp-aa` remains the holdout. Its input has one call subexpression
-(`fMatch(...)`) and no useful equation directly *for* `fMatch` is
-something the LLM is willing to propose — it keeps trying equations
-relating `gN`/`gM` to `fMatch`, with the wrong side as LHS. Likely
-fixes:
-- Make the rewriter accept LHS = subexpression *modulo program
-  unfolding* (so a lemma about `gM(p, s, p, s)` would apply to
-  `fMatch(p, s)` after unfolding `fMatch(p, s) = gM(p, s, p, s)`).
-  This is real engineering on the rewriter, not prompt work.
-- Or switch to a less reductionist test input where there are more
-  candidate subexpressions.
+The remaining variance and the `add-commute` holdout point at
+LLM-side proof unreliability, not at the architecture.
 
 **Not yet:**
-1. **Smarter rewriter — pattern match modulo program unfolding**:
-   currently a lemma's LHS must syntactically match a subexpression.
-   Allow it to match after one or two steps of f-call unfolding (and
-   maybe g-call dispatch with a known constructor). Would unlock
-   `kmp-aa` and broaden the class of useful lemmas in general.
+1. **Multi-sample lemma proposals**: have the LLM emit N candidate
+   proofs per turn and verify each. Damps variance from
+   non-deterministic proof writing (the dominant remaining failure
+   mode). Cost-multiplier on Bedrock spend; would likely close
+   `add-commute` and stabilize `even-square`.
 2. **Try every lemma in the chain against the input on each
    iteration**: currently we only try the most recently verified
    lemma against the current expression. A re-application pass would
@@ -306,9 +316,9 @@ fixes:
 4. **Persistent lemma library**: cache verified lemmas across
    supercompile runs so each program "learns" over time.
 5. **Auto-prove tactic widening**: nothing has tripped the
-   LLM-as-prover path with an Ok verdict yet across the four
-   benchmarks. Real induction-needing conjectures (e.g.
-   `gAdd x Z ≡ x`) would benefit from a tactic like
+   LLM-as-prover path with an Ok verdict yet on the existing
+   benchmarks. Real induction-needing conjectures would benefit
+   from a tactic like
    `first | simp_all | (intros; induction <;> simp_all)`.
 
 ## Why this matters

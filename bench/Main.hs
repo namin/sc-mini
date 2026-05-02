@@ -60,6 +60,11 @@ benchmarks =
       ([expr|fMatch(Cons(A(), Cons(A(), Nil())), s)|], prog2)
       prog2Types
       (5, 40)
+  , Benchmark
+      "add-commute"
+      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
+      prog3Types
+      (0, 40)
   ]
 
 data Stats = Stats

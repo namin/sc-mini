@@ -293,6 +293,17 @@ unify `lemmaLhs ~ s` treating `lemmaForall` names as metavariables.
 If unification succeeds with substitution σ, replace `s` with
 `lemmaRhs[σ]`. Recurse on children otherwise.
 
+**Modulo program unfolding.** When unification fails on a head
+mismatch, try one step of program unfolding on the candidate side
+(replace an FCall with its body, or a GCall-on-Ctr with the matching
+clause's body) and retry. This lets a lemma about `gMult(x, x)` apply
+to a candidate `fSqr(x)` because `fSqr(x) = gMult(x, x)` unfolds into
+shape. The unfolding is used only for matching purposes — the rewrite
+still replaces the original (pre-unfold) subexpression with the
+lemma's RHS substituted by the unifier's bindings. Default budget is
+one unfolding step; bumping to two or more risks combinatorial
+blow-up on g-call dispatches.
+
 ### Fixed-point iteration
 
 After each successful lemma application, the rewritten expression is
@@ -317,12 +328,23 @@ as `rw [lemma_n]` / `simp [lemma_n]` rules.
 If the LLM's proof fails to verify, the system reprompts the LLM
 with the Lean error and asks for a fixed proof of the *same* lemma
 (forall/lhs/rhs preserved, only the `by …` body changes). Up to
-`distillProofRetries = 1` retry per lemma. The retry prompt is
-distinct from the proposal prompt — it specifies the lemma to prove
-and the prior failure verbatim, plus a small set of common-fixes
-hints (e.g. "prefer `simp` over `simp only`", "use `Nat'.S` not
-`S`"). Empirically the retry is what unlocks chained proofs that
-the LLM can't get right on the first attempt.
+`distillProofRetries = 1` retry per lemma.
+
+### Rejects tracking and conditional guidance
+
+Rejected proposals (lemma + final Lean error) accumulate alongside
+verified ones, and appear in subsequent prompts so the LLM doesn't
+re-propose the same broken lemma. This was empirically necessary —
+without it, the LLM would mode-collapse and propose the same failing
+lemma every iteration.
+
+The "you may propose helper sub-lemmas" license is conditional on
+prior failures. The first iteration prompt is strict on-candidate
+("propose a lemma whose LHS is a subexpression of the input"). After
+a rejection, subsequent prompts open up to off-candidate helpers.
+This split prevents two failure modes that were observed without it:
+proposing too-narrow lemmas (when decomposition was needed) and
+proposing off-target lemmas (when a direct one would have worked).
 
 ### What v1 doesn't do
 

@@ -47,23 +47,58 @@ type Bindings = [(Name, Expr)]
 -- other vars must match the same Var literally. Returns the binding map
 -- on success.
 unify :: [Name] -> Expr -> Expr -> Maybe Bindings
-unify pvars (Var v) e | v `elem` pvars = Just [(v, e)]
-unify _     (Var v1) (Var v2) | v1 == v2 = Just []
-unify pvars (Ctr n1 es1) (Ctr n2 es2)
-  | n1 == n2 = unifyAll pvars es1 es2
-unify pvars (FCall n1 es1) (FCall n2 es2)
-  | n1 == n2 = unifyAll pvars es1 es2
-unify pvars (GCall n1 es1) (GCall n2 es2)
-  | n1 == n2 = unifyAll pvars es1 es2
-unify _ _ _ = Nothing
+unify = unifyMod 0 (Program [] [])  -- no unfolding budget, no program needed
 
-unifyAll :: [Name] -> [Expr] -> [Expr] -> Maybe Bindings
-unifyAll _ [] [] = Just []
-unifyAll pvars (a:as) (b:bs) = do
-  bA <- unify pvars a b
-  bR <- unifyAll pvars as bs
+-- Unification modulo program unfolding. When the lemma's LHS and the
+-- candidate have different heads, try unfolding the candidate by one
+-- step (FCall body substitution, or GCall-on-Ctr clause selection) and
+-- retry — up to `k` steps total. This lets a lemma about `gMult` apply
+-- to a candidate that is `fSqr(...)`, since `fSqr(x) = gMult(x, x)`
+-- unfolds into shape.
+unifyMod :: Int -> Program -> [Name] -> Expr -> Expr -> Maybe Bindings
+unifyMod _ _ pvars (Var v) e | v `elem` pvars = Just [(v, e)]
+unifyMod _ _ _ (Var v1) (Var v2) | v1 == v2 = Just []
+unifyMod k p pvars (Ctr n1 es1) (Ctr n2 es2)
+  | n1 == n2 = unifyAllMod k p pvars es1 es2
+unifyMod k p pvars (FCall n1 es1) (FCall n2 es2)
+  | n1 == n2 = unifyAllMod k p pvars es1 es2
+unifyMod k p pvars (GCall n1 es1) (GCall n2 es2)
+  | n1 == n2 = unifyAllMod k p pvars es1 es2
+unifyMod k p pvars lhs rhs
+  | k <= 0    = Nothing
+  | otherwise = case unfoldStep p rhs of
+      Just rhs' -> unifyMod (k - 1) p pvars lhs rhs'
+      Nothing   -> Nothing
+
+unifyAllMod :: Int -> Program -> [Name] -> [Expr] -> [Expr] -> Maybe Bindings
+unifyAllMod _ _ _ [] [] = Just []
+unifyAllMod k p pvars (a:as) (b:bs) = do
+  bA <- unifyMod k p pvars a b
+  bR <- unifyAllMod k p pvars as bs
   mergeBindings bA bR
-unifyAll _ _ _ = Nothing
+unifyAllMod _ _ _ _ _ = Nothing
+
+-- One step of unfolding at the top of an expression. FCalls always
+-- unfold (substitute the body); GCalls unfold only when the scrutinee
+-- (first arg) is a constructor. Returns Nothing when no top-level
+-- unfolding is possible (e.g. Var or Let, or GCall-on-Var).
+unfoldStep :: Program -> Expr -> Maybe Expr
+unfoldStep prog (FCall fn es) =
+  case [f | f@(FDef n _ _) <- fdefs prog, n == fn] of
+    (FDef _ vs body : _) -> Just (body // zip vs es)
+    []                   -> Nothing
+unfoldStep prog (GCall gn (Ctr cn cargs : es)) =
+  case [g | g@(GDef n (Pat c _) _ _) <- gdefs prog, n == gn, c == cn] of
+    (GDef _ (Pat _ cvs) vs body : _) ->
+      Just (body // zip (cvs ++ vs) (cargs ++ es))
+    [] -> Nothing
+unfoldStep _ _ = Nothing
+
+fdefs :: Program -> [FDef]
+fdefs (Program fs _) = fs
+
+gdefs :: Program -> [GDef]
+gdefs (Program _ gs) = gs
 
 -- Merge two binding sets; reject inconsistencies (same pvar bound to
 -- different terms).
@@ -83,25 +118,34 @@ mergeBindings ((v, e) : rest) b2 =
 -- =========================================================================
 
 -- Top-down search for a subexpression matching the lemma's LHS.
--- Returns Just rewritten on first match, Nothing if the lemma doesn't
--- apply anywhere in `e`.
-rewriteWith :: Lemma -> Expr -> Maybe Expr
-rewriteWith lem e =
-  case unify (map fst (lemmaForall lem)) (lemmaLhs lem) e of
+-- Matching is modulo one step of program unfolding: a lemma about
+-- `gMult(x, x)` will apply to a `fSqr(x)` subexpression because
+-- `fSqr(x) = gMult(x, x)` unfolds into shape. The unfolding is used
+-- only for pattern matching — the rewrite still replaces the original
+-- (pre-unfold) subexpression with the lemma's RHS, substituted by the
+-- unifier's bindings.
+rewriteWith :: Program -> Lemma -> Expr -> Maybe Expr
+rewriteWith prog lem e =
+  case unifyMod unfoldBudget prog (map fst (lemmaForall lem)) (lemmaLhs lem) e of
     Just b  -> Just (lemmaRhs lem // b)
     Nothing -> tryChildren e
   where
+    -- One step is enough for the f-wraps-g pattern (`fSqr` → `gMult`).
+    -- Bumping to 2+ would cover deeper wraps but risks combinatorial
+    -- blow-up on g-call dispatch when scrutinees are constructors.
+    unfoldBudget = 1
+
     tryChildren (Ctr   n es)     = Ctr   n <$> tryList es
     tryChildren (FCall n es)     = FCall n <$> tryList es
     tryChildren (GCall n es)     = GCall n <$> tryList es
     tryChildren (Let (v, e1) e2) =
-      case rewriteWith lem e1 of
+      case rewriteWith prog lem e1 of
         Just e1' -> Just (Let (v, e1') e2)
-        Nothing  -> Let (v, e1) <$> rewriteWith lem e2
+        Nothing  -> Let (v, e1) <$> rewriteWith prog lem e2
     tryChildren _                = Nothing
 
     tryList []     = Nothing
-    tryList (x:xs) = case rewriteWith lem x of
+    tryList (x:xs) = case rewriteWith prog lem x of
       Just x' -> Just (x' : xs)
       Nothing -> (x:) <$> tryList xs
 
@@ -109,8 +153,14 @@ rewriteWith lem e =
 -- LLM prompt: ask for one eureka lemma about the program + expression
 -- =========================================================================
 
-buildLemmaPrompt :: TypeEnv -> Program -> [Lemma] -> Expr -> String
-buildLemmaPrompt env prog context e = unlines $
+buildLemmaPrompt
+  :: TypeEnv
+  -> Program
+  -> [Lemma]            -- verified lemmas (chain context)
+  -> [(Lemma, String)]  -- rejected attempts (negative evidence)
+  -> Expr
+  -> String
+buildLemmaPrompt env prog context rejects e = unlines $
   [ "You are a supercompiler that's about to drive an SLL expression."
   , "Before driving starts, propose ONE eureka lemma about the program"
   , "that would simplify the expression. The lemma must be a"
@@ -131,7 +181,7 @@ buildLemmaPrompt env prog context e = unlines $
   , "Function signatures:"
   , showFunSigs (funSigs env)
   , ""
-  ] ++ contextSection ++
+  ] ++ contextSection ++ rejectsSection ++
   [ "Expression we will supercompile:"
   , "  " ++ showSLL e
   , ""
@@ -142,13 +192,8 @@ buildLemmaPrompt env prog context e = unlines $
   , "`forall n, gHalf(gDouble(n)) = n` — its LHS `gHalf(gDouble(n))` is"
   , "a subexpression of the input."
   , ""
-  , "Lemmas whose LHS doesn't appear (under variable substitution) as a"
-  , "subexpression of the input expression cannot be applied. Don't"
-  , "propose them; if you can't find a useful applicable lemma, reply"
-  , "NONE. Verified lemmas from earlier iterations (listed above) are"
-  , "available as rewrite rules in your proof — use them via"
-  , "`rw [lemma_n]` or `simp [lemma_n]` if they help close the proof of"
-  , "an applicable lemma."
+  ] ++ goalGuidance ++
+  [ "Reply NONE only if you genuinely can't find anything useful."
   , ""
   , "Your reply must be EXACTLY this format (each marker on its own line):"
   , ""
@@ -181,6 +226,52 @@ buildLemmaPrompt env prog context e = unlines $
               | l <- context
               ]
             ++ [""]
+    rejectsSection
+      | null rejects = []
+      | otherwise =
+          "Previous proposals that failed Lean verification — DO NOT"
+            : "re-propose these (or trivial variants); try something different,"
+            : "such as a smaller helper lemma:"
+            : concat
+                [ [ "  Attempted: "
+                      ++ showSLL (lemmaLhs l) ++ " = " ++ showSLL (lemmaRhs l)
+                      ++ forallSummary l
+                  , "    Lean error: " ++ take 200 (firstLine reason)
+                  ]
+                | (l, reason) <- rejects
+                ]
+            ++ [""]
+    -- The goal guidance is conditional on whether we've already tried and
+    -- failed. On the first iteration (no rejects), be strict — propose a
+    -- lemma whose LHS is a subexpression of the input. After a failure,
+    -- soften — a helper lemma about a related function is fine, since
+    -- it'll accumulate in the chain and become available for proving the
+    -- on-target lemma in a subsequent iteration.
+    goalGuidance
+      | null rejects =
+          [ "Propose a lemma whose LHS is a subexpression of the input"
+          , "expression (under variable substitution if needed). The"
+          , "rewriter will apply it directly; off-target lemmas are not"
+          , "useful at this stage."
+          , ""
+          ]
+      | otherwise =
+          [ "Since a previous attempt failed (see above), you have two"
+          , "good options now:"
+          , "  (a) Propose a different lemma whose LHS is a subexpression"
+          , "      of the input — perhaps a slightly different statement"
+          , "      that's easier to prove."
+          , "  (b) Propose a smaller helper lemma — its LHS doesn't have"
+          , "      to be a subexpression of the input, but it should be"
+          , "      provable and useful as a `rw` rule when you next try"
+          , "      the on-target lemma. Example: to prove gAdd"
+          , "      commutativity, helpers like `gAdd(x, Z()) = x` and"
+          , "      `gAdd(x, S(y)) = S(gAdd(x, y))` are useful."
+          , "Verified helpers from earlier iterations (listed above) are"
+          , "already available via `rw [lemma_n]` / `simp [lemma_n]`."
+          , ""
+          ]
+    firstLine s = takeWhile (/= '\n') (dropWhile (== '\n') s)
     forallSummary l = case lemmaForall l of
       []  -> ""
       fas -> "  (forall "
@@ -295,16 +386,17 @@ proposeLemma
   :: IORef Int           -- LLM call counter (for stats / accounting)
   -> TypeEnv
   -> Program
-  -> [Lemma]             -- previously-verified lemmas
+  -> [Lemma]             -- previously-verified lemmas (chain context)
+  -> [(Lemma, String)]   -- previously-rejected proposals + failure reasons
   -> Expr
   -> Name                -- name to assign to the proposed lemma
   -> IO (Maybe Lemma)
-proposeLemma counter env prog context e name = do
+proposeLemma counter env prog context rejects e name = do
   modifyIORef' counter (+1)
   k <- readIORef counter
   hPutStrLn stderr $ "  [distill] requesting lemma #" ++ show k
                        ++ " for: " ++ showSLL e
-  result <- try (chat (buildLemmaPrompt env prog context e))
+  result <- try (chat (buildLemmaPrompt env prog context rejects e))
               :: IO (Either SomeException String)
   case result of
     Left err -> do
@@ -327,17 +419,20 @@ proposeLemma counter env prog context e name = do
 -- `retries` attempts. Each retry is one Bedrock call charged to the
 -- shared counter. The LHS/RHS/forall stay fixed; only the proof body
 -- changes.
+--
+-- Returns `Right verifiedLemma` on success or `Left failureReason`
+-- with the final Lean error string on failure. Callers can use the
+-- failure reason to surface to the LLM in subsequent prompts so it
+-- doesn't re-propose the same broken lemma.
 verifyLemma
-  :: IORef Int           -- LLM call counter
-  -> Int                 -- proof-retry budget (0 = no retry)
+  :: IORef Int
+  -> Int
   -> TypeEnv
   -> Program
   -> [Lemma]
   -> Lemma
   -> LeanProject
-  -> IO (Maybe Lemma)    -- Just the verified lemma (with possibly
-                         --   updated proof), or Nothing if all
-                         --   attempts failed
+  -> IO (Either String Lemma)
 verifyLemma counter retries env prog context lem proj = go 0 lem
   where
     go n l = do
@@ -345,11 +440,11 @@ verifyLemma counter retries env prog context lem proj = go 0 lem
       case v of
         Ok -> do
           hPutStrLn stderr "  [distill] lemma verified by Lean"
-          return (Just l)
+          return (Right l)
         Failed s
           | n >= retries -> do
               hPutStrLn stderr $ "  [distill] lemma rejected: " ++ take 200 s
-              return Nothing
+              return (Left s)
           | otherwise -> do
               hPutStrLn stderr $ "  [distill] proof failed (attempt "
                 ++ show (n+1) ++ "/" ++ show (retries+1) ++ "), retrying"
@@ -357,7 +452,7 @@ verifyLemma counter retries env prog context lem proj = go 0 lem
               case mLem' of
                 Nothing -> do
                   hPutStrLn stderr "  [distill] retry produced no proof; giving up"
-                  return Nothing
+                  return (Left s)
                 Just l' -> go (n + 1) l'
 
 -- Ask the LLM to fix the proof of an existing lemma, given Lean's
@@ -479,28 +574,34 @@ distillTask
   -> LeanProject
   -> Expr                -- input expression
   -> IO Expr             -- distilled expression (may equal input)
-distillTask counter budget proofRetries env prog proj = go 1 []
+distillTask counter budget proofRetries env prog proj = go 1 [] []
   where
-    go i ctx e | i > budget = return e
-    go i ctx e = do
+    -- ctx:      lemmas verified in this distillation (available for chaining)
+    -- rejects:  proposals that failed to verify (surfaced to the LLM so it
+    --           doesn't keep re-proposing the same broken lemma)
+    go i ctx rejects e | i > budget = return e
+    go i ctx rejects e = do
       let lemName = "lemma_" ++ show i
-      mLem <- proposeLemma counter env prog ctx e lemName
+      mLem <- proposeLemma counter env prog ctx rejects e lemName
       case mLem of
         Nothing  -> return e        -- LLM declined or parse failed; stop
         Just lem -> do
           mVerified <- verifyLemma counter proofRetries env prog ctx lem proj
           case mVerified of
-            Nothing   -> go (i + 1) ctx e
-            Just lem' ->
+            Left reason ->
+              -- record the failed attempt so the next iteration's prompt
+              -- can show "you already tried this and it didn't verify"
+              go (i + 1) ctx (rejects ++ [(lem, reason)]) e
+            Right lem' ->
               -- verified — accumulate in context regardless of whether
               -- it rewrites the current expression
               let ctx' = ctx ++ [lem']
-              in case rewriteWith lem' e of
+              in case rewriteWith prog lem' e of
                    Nothing -> do
                      hPutStrLn stderr
                        "  [distill] lemma verified, kept in context (no match for e)"
-                     go (i + 1) ctx' e
+                     go (i + 1) ctx' rejects e
                    Just e' -> do
                      hPutStrLn stderr $ "  [distill] applied: " ++ showSLL e'
-                     go (i + 1) ctx' e'
+                     go (i + 1) ctx' rejects e'
 

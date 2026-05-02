@@ -82,6 +82,15 @@ benchmarks =
       , ("ABABAA",      [("s", lsym [A, B, A, B, A, A])])
       , ("BBBBAA",      [("s", lsym [B, B, B, B, A, A])])
       ]
+  , PerfBench
+      "add-commute"
+      ([expr|gEq(gAdd(x, y), gAdd(y, x))|], prog3)
+      prog3Types
+      -- Use distinct x, y so the equality is a real test (not trivially x=x).
+      [ (show k ++ "/" ++ show (k+1),
+         [("x", peano k), ("y", peano (k+1))])
+      | k <- [0, 1, 2, 4, 6, 8, 10]
+      ]
   ]
 
 main :: IO ()

@@ -170,45 +170,81 @@ residual (HE whistle, `supercompileIOWithTypes`) — then runs each
 through `intC` (the counting interpreter) on a series of concrete
 inputs and reports step counts and ratios.
 
-Sample output (with distillation, lemma chaining, and proof retry):
+Sample output (typical run; outcomes have run-to-run variance — see
+"Variance floor" below):
 
 ```
-==> even-square    (distillation: gEven(fSqr(x)) = gEven(x) applied)
+==> even-square
     sizes: orig=11  classical=328  llm=4
     input    |  orig  |  class |   llm  | cls/orig |  llm/orig | llm/cls
     ---------+--------+--------+--------+----------+-----------+--------
     12       |    315 |     13 |     13 |    0.04  |    0.04   |   1.00
 
-==> add-assoc      (distillation: associativity lemma applied)
+==> add-assoc
     sizes: orig=11  classical=4  llm=4
     10       |     32 |     22 |     22 |    0.69  |    0.69   |   1.00
 
-==> half-of-double (distillation: chain of two lemmas collapses to True())
+==> half-of-double
     sizes: orig=14  classical=2  llm=0
     12       |     64 |     13 |      0 |    0.20  |    0.00   |   0.00
 
-==> kmp-aa         (distillation: no matching lemma found)
+==> kmp-aa
     sizes: orig=15  classical=9  llm=37
     ABABAA   |     46 |     15 |     39 |    0.33  |    0.85   |   2.60
+
+==> add-commute
+    sizes: orig=14  classical=207  llm=14
+    10/11    |     67 |     25 |     67 |    0.37  |    1.00   |   2.68
 ```
 
-Three of four benchmarks: the LLM path matches or beats classical.
+Where the LLM path lands:
 
 - **half-of-double** is the headline win: distillation chains
   `gHalf(gDouble(n)) = n` and `gEq(n, n) = True()` to reduce the input
   to a constant. **0 functions, 0 steps** — strictly smaller and
   faster than classical.
-- **even-square** is the headline *size* win: same speed as classical
-  (13 steps at n=12) but the residual is 4 functions vs. classical's
-  328. Two-orders-of-magnitude smaller residual for identical
-  runtime, via the single Lean-verified lemma
-  `gEven(fSqr(x)) = gEven(x)`.
+- **even-square** is the headline *size* win when it lands: same
+  speed as classical (13 steps at n=12) but the residual is 4
+  functions vs. classical's 328. Two-orders-of-magnitude smaller
+  residual for identical runtime, via the single Lean-verified lemma
+  `gEven(fSqr(x)) = gEven(x)`. The smarter rewriter also handles the
+  `gMult`-flavored variant `gEven(gMult(x, x)) = gEven(x)`.
 - **add-assoc** ties classical at 4 functions and 22 steps via the
   associativity lemma.
-- **kmp-aa** still doesn't unlock — the input has only one call
-  subexpression (`fMatch(...)`) and the LLM struggles to write a
-  useful equation directly for `fMatch` rather than for the
-  underlying `gN`/`gM` machinery.
+- **kmp-aa** is structurally out of scope — the input has only one
+  call subexpression (`fMatch(...)`); no useful semantic lemma exists
+  at the candidate level.
+- **add-commute** is the informative failure: the LLM correctly
+  identifies the chain it needs (helpers `gAdd(x, Z) = x` and
+  `gAdd(x, S(y)) = S(gAdd(x, y))`, then commutativity). Helpers
+  verify; commutativity itself doesn't, because the LLM's Lean
+  proof attempts use invalid tactics that retry doesn't always
+  salvage.
+
+### Variance floor
+
+Outcomes across runs are not deterministic. Even with the same code
+and the same prompt, the LLM picks different lemma forms and writes
+different proofs, sometimes succeeding and sometimes hitting Lean
+syntax errors. We've observed:
+
+- `even-square` landing at 4 fns / 13 steps in some runs; 22 fns /
+  314 steps (no distillation help) in others — depending on whether
+  the LLM's chosen proof verifies.
+- `add-commute` consistently chains the right helpers but the
+  commutativity proof fails for various reasons each run.
+- The other three benchmarks are stable.
+
+Common LLM-side proof failures we see:
+- Lean stdlib `Nat` constructors (`zero`/`succ`) used instead of
+  our `Nat'` (`Z`/`S`).
+- `simp only [...]` where `simp [...]` was needed.
+- Invalid tactic names like `unfolding`.
+
+These are model capability issues with current Sonnet 4.6 on Lean 4
+specifically. Multi-sample proposals (verify N candidate proofs per
+turn and pick whichever verifies) would damp this at the cost of
+more Bedrock calls; we haven't built that.
 
 **The harness is also a correctness check**: it verifies all three
 variants produce the same value on every test input. Mismatches would
@@ -221,41 +257,34 @@ classical's performance with a strictly smaller residual. When the
 LLM can't find or prove the right lemmas, the path falls back to
 whistle-time generalizations and produces a compact, correct,
 machine-checked residual — but with the same step count as the
-original program.
+original program. The empirical picture across 5 benchmarks:
 
-Distillation succeeds on three of four benchmarks:
-
-- `even-square`: LLM proposes `forall x, gEven(fSqr(x)) = gEven(x)`,
-  Lean verifies; the rewriter applies it, the supercompiler drives
-  `gEven(x)` to a 4-function residual. Same step count as classical
-  (13 at n=12), 82x smaller code (classical's residual is 328
-  functions). **Same speed, dramatically smaller.**
-- `add-assoc`: LLM proposes `forall x y z, gAdd(gAdd(x,y),z) =
-  gAdd(x, gAdd(y,z))`, Lean verifies; residual drops to 4 functions,
-  matching classical at 22 steps for k=10.
-- `half-of-double`: LLM chains two lemmas — `forall n,
-  gHalf(gDouble(n)) = n` and `forall n, gEq(n, n) = True()`. The
-  second proof failed on first attempt; the proof-retry loop fed the
-  Lean error back and the LLM produced a working proof. Both lemmas
-  apply, reducing the input to the constant `True()`. Residual: 0
-  functions, 0 steps. **Strictly smaller than classical (2 functions,
-  13 steps at n=12).**
-
-Distillation doesn't succeed on `kmp-aa`: the input
-`fMatch(Cons(A, Cons(A, Nil)), s)` has only one call subexpression
-(`fMatch` itself), and the LLM struggles to write a useful equation
-directly for `fMatch` rather than for the underlying `gN`/`gM`
-machinery. The lemmas it proposes verify but don't pattern-match
-the input.
+- `half-of-double` is the headline: chained lemmas
+  (`gHalf(gDouble(n)) = n` then `gEq(n, n) = True`) reduce the input
+  to a constant. **Beats classical strictly** — 0 fns / 0 steps vs.
+  2 fns / 13 steps at n=12.
+- `even-square` (when the LLM's proof verifies) lands at 4 fns / 13
+  steps — same speed as classical, **82x smaller residual**. Has
+  run-to-run variance; sometimes the LLM's proof attempt fails and
+  the residual drops to no-distillation level.
+- `add-assoc` ties classical (4 fns / 22 steps) via associativity.
+- `kmp-aa` doesn't unlock — structurally out of scope (only one
+  call subexpression in the input; no useful semantic lemma at the
+  candidate level).
+- `add-commute` is an informative failure: LLM correctly chains the
+  needed helpers; final commutativity proof fails. Documents the
+  current LLM proof-writing reliability ceiling.
 
 The empirical answer to "is the LLM-augmented supercompiler better
-than classical": **on three of four benchmarks, yes — either
-strictly faster, or same-speed-but-much-smaller-code, or both**. On
-the fourth, the LLM produces a correct residual that's bigger than
-classical. This is exactly the regime the original PLAN.md was
-aiming at: the LLM contributes semantic insight (parity-of-square,
-gHalf-after-gDouble, associativity) that classical supercompilation
-has no machinery to discover.
+than classical": **on benchmarks where the LLM writes a clean Lean
+proof, yes — sometimes strictly faster, sometimes same-speed-but-
+much-smaller-code**. On benchmarks where the LLM's Lean-proof
+attempts hit invalid tactics, retries don't always salvage them and
+distillation falls through to the whistle-time path. This is exactly
+the regime the original PLAN.md was aiming at: the LLM contributes
+semantic insight (parity-of-square, gHalf-after-gDouble,
+associativity) that classical supercompilation has no machinery to
+discover — *when the LLM can prove the lemma cleanly*.
 
 ## Distillation pre-pass
 
