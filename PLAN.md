@@ -174,6 +174,14 @@ trust the LLM.
   (lemma's quantified vars as metavariables); on a match, the input
   is rewritten with the lemma's RHS. Iterates up to a small budget
   (`maxDistillLemmas = 3` LLM calls per supercompile).
+- Lemma chaining: verified lemmas accumulate across iterations of the
+  pre-pass. They're (a) inlined at the top of subsequent
+  `Conjecture_<n>.lean` files (with their already-checked proofs) so
+  Lean recognizes them as available rewrite rules, and (b) listed in
+  the prompt to the LLM so it can reference them by name in `rw [...]`
+  / `simp [...]` invocations. The prompt also encourages
+  decomposition: if the lemma the LLM ideally wants to state needs a
+  sub-lemma, propose the sub-lemma this turn, build the chain.
 
 ## Empirical findings from the perf harness
 
@@ -226,21 +234,62 @@ codebase. When the LLM can't prove the right lemma, the system
 gracefully falls back and produces the same compact-but-not-faster
 residual we had before.
 
+## Where lemma chaining did and didn't help
+
+Lemma chaining was added in the hope of unlocking `even-square` (the
+right lemma `gEven(fSqr(x)) = gEven(x)` needs sub-lemmas about
+`gMult`'s parity that single-shot induction can't close). Empirically
+the infrastructure is in place and verified lemmas DO accumulate, but
+no benchmark's outcome flipped from "no help" to "win" purely from
+chaining. The bottleneck moved: it's now **LLM proof reliability**,
+not whether the LLM has access to chained context.
+
+Concrete observations from a chaining run:
+
+- `half-of-double` regressed: in an earlier run the LLM wrote
+  `simp [gDouble, gHalf, gHalf1]; exact ih` (works); in the chaining
+  run it wrote `simp only [gDouble, gHalf, gHalf1]; exact ih` (fails
+  — `simp only` doesn't reduce `(gHalf (gDouble x)).S = x.S` to
+  match `ih`). Same target, same lemma, different LLM choice →
+  different outcome. Distillation is probabilistic at the proof
+  level.
+- `add-assoc` continued to work: associativity lemma verified on
+  first try, applied, residual matches classical at 4 functions.
+- `even-square` still failed: LLM proposed wrong main lemmas (e.g.
+  `gEven(gAdd(x,x)) = True` — false) or proofs with `S` instead of
+  `Nat'.S` (raw constructor doesn't resolve in Lean).
+- `kmp-aa`: one lemma verified but didn't match the input expression;
+  chaining preserved it for future iterations, but the LLM didn't
+  use it productively within the 3-call budget.
+
+The takeaway: lemma chaining is a real architectural piece that
+correctly threads context through the distillation loop, but the
+proof step itself is non-deterministic and brittle. The next-most-
+leverage improvement is *proof retry* — when Lean rejects a proof,
+re-prompt the LLM with the error and let it fix the proof for the
+*same* lemma, rather than discarding the lemma and asking for an
+entirely different one.
+
 **Not yet:**
-1. Distillation v2 — concrete improvements informed by the v1 trace:
-   - **Lemma chaining**: keep verified lemmas as hypotheses or simp
-     rules in subsequent proof attempts. Would unlock `even-square`.
-   - **Targeted prompting**: ask for a lemma about a specific
-     subexpression rather than "anything useful". Would help kmp-aa.
-   - **Oscillation detection**: stop the iteration loop early if the
-     same lemma is proposed in alternating directions (add-assoc
-     traces show A→B→A→B; the trail is correct but wasteful).
-   - **Persistent lemma library**: cache verified lemmas across
-     supercompile runs so each program "learns" over time.
-2. Auto-prove tactic widening: nothing has tripped the LLM-as-prover
-   path with an Ok verdict yet across the four benchmarks. Real
-   induction-needing conjectures (e.g. `gAdd x Z ≡ x`) would benefit
-   from a tactic like
+1. **Proof retry on verification failure**: currently when
+   `verifyLemma` rejects, the lemma is discarded entirely. A retry
+   loop (similar to the existing `llmProveBody` step in the whistle
+   path) would feed the Lean error back to the LLM and ask for a
+   fixed proof of the same lemma. Probably the highest-leverage
+   improvement after chaining; addresses the regression mode
+   observed above.
+2. **Targeted prompting**: ask for a lemma about a specific
+   subexpression rather than "anything useful". Would help `kmp-aa`,
+   where the LLM proposes plausible but non-matching lemmas.
+3. **Oscillation detection**: detect when a lemma rewrites in one
+   direction and a subsequent lemma reverses it. Doesn't unblock
+   benchmarks but prevents wasted Bedrock calls.
+4. **Persistent lemma library**: cache verified lemmas across
+   supercompile runs so each program "learns" over time.
+5. **Auto-prove tactic widening**: nothing has tripped the
+   LLM-as-prover path with an Ok verdict yet across the four
+   benchmarks. Real induction-needing conjectures (e.g.
+   `gAdd x Z ≡ x`) would benefit from a tactic like
    `first | simp_all | (intros; induction <;> simp_all)`.
 
 ## Why this matters

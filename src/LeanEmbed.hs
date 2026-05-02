@@ -259,23 +259,33 @@ embedConjecture env _ e e' proof =
        , "  " ++ proof
        ]
 
--- Lemma.lean: imports the prebuilt Program module, then asserts a
--- universally-quantified equality under the LLM-supplied proof body.
+-- Lemma.lean: imports the prebuilt Program module and re-states each
+-- previously-verified lemma (with its already-checked proof) so the
+-- LLM's new proof can reference them via `rw [lemma_n]` /
+-- `simp [lemma_n]`. Then asserts the new equality under the
+-- LLM-supplied proof body.
+--
 -- Binders go *before* the colon (Lean's parameter form) rather than as
 -- `forall`-quantified names after — Lean only puts the parameter form
 -- in scope inside the proof body, so the LLM can write `induction n`
 -- directly without a leading `intro n`.
-embedLemma :: TypeEnv -> Program -> Lemma -> String
-embedLemma _ _ lem =
-  let binders = if null (lemmaForall lem)
-                  then ""
-                  else " " ++ unwords [typedBinder v t | (v, t) <- lemmaForall lem]
-      lhs = renderExpr (lemmaLhs lem)
-      rhs = renderExpr (lemmaRhs lem)
-  in unlines
-       [ "import Program"
-       , ""
-       , "theorem " ++ lemmaName lem ++ binders ++ " : "
-           ++ lhs ++ " = " ++ rhs ++ " :="
-       , "  " ++ lemmaProof lem
-       ]
+embedLemma :: TypeEnv -> Program -> [Lemma] -> Lemma -> String
+embedLemma _ _ context lem =
+  unlines $
+    [ "import Program"
+    , ""
+    ] ++
+    concat [ [ renderTheorem prev, "" ] | prev <- context ] ++
+    [ renderTheorem lem ]
+  where
+    renderTheorem l =
+      let binders = if null (lemmaForall l)
+                      then ""
+                      else " " ++ unwords [typedBinder v t | (v, t) <- lemmaForall l]
+          lhs = renderExpr (lemmaLhs l)
+          rhs = renderExpr (lemmaRhs l)
+      in unlines
+           [ "theorem " ++ lemmaName l ++ binders ++ " : "
+               ++ lhs ++ " = " ++ rhs ++ " :="
+           , "  " ++ lemmaProof l
+           ]

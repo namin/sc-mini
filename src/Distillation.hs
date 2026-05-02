@@ -109,8 +109,8 @@ rewriteWith lem e =
 -- LLM prompt: ask for one eureka lemma about the program + expression
 -- =========================================================================
 
-buildLemmaPrompt :: TypeEnv -> Program -> Expr -> String
-buildLemmaPrompt env prog e = unlines
+buildLemmaPrompt :: TypeEnv -> Program -> [Lemma] -> Expr -> String
+buildLemmaPrompt env prog context e = unlines $
   [ "You are a supercompiler that's about to drive an SLL expression."
   , "Before driving starts, propose ONE eureka lemma about the program"
   , "that would simplify the expression. The lemma must be a"
@@ -131,7 +131,8 @@ buildLemmaPrompt env prog e = unlines
   , "Function signatures:"
   , showFunSigs (funSigs env)
   , ""
-  , "Expression we will supercompile:"
+  ] ++ contextSection ++
+  [ "Expression we will supercompile:"
   , "  " ++ showSLL e
   , ""
   , "Goal: a lemma whose LHS matches a subexpression of the expression"
@@ -139,6 +140,12 @@ buildLemmaPrompt env prog e = unlines
   , "or replaces a complex computation with a variable). For instance,"
   , "if the program defines double and half, a useful lemma might be"
   , "`forall n, gHalf(gDouble(n)) = n`."
+  , ""
+  , "If the lemma you'd ideally state needs sub-lemmas to prove, propose"
+  , "ONE of those sub-lemmas this turn — it will be verified and made"
+  , "available as a rewrite rule in your next attempt. Building up a"
+  , "chain of small, individually-provable lemmas is preferable to"
+  , "proposing one big lemma whose proof you can't fit in one shot."
   , ""
   , "Your reply must be EXACTLY this format (each marker on its own line):"
   , ""
@@ -153,11 +160,29 @@ buildLemmaPrompt env prog e = unlines
   , "  - `rfl` for definitional equalities"
   , "  - `simp_all` (no defs list — relies on default simp set)"
   , "  - `show <goal>; rw [ih]` for inductive cases"
+  , "  - `rw [<lemma_name>]` or `simp [<lemma_name>]` to use any"
+  , "    previously-verified lemma listed above"
   , "  - `Type'.Ctr` to disambiguate constructors (e.g. `Nat'.S`)"
   , ""
   , "If no useful lemma exists for this expression, reply with the"
   , "single word NONE on a line by itself."
   ]
+  where
+    contextSection
+      | null context = []
+      | otherwise =
+          "Previously-verified lemmas (available as rewrite rules in your proof):"
+            : [ "  " ++ lemmaName l ++ ": "
+                  ++ showSLL (lemmaLhs l) ++ " = " ++ showSLL (lemmaRhs l)
+                  ++ forallSummary l
+              | l <- context
+              ]
+            ++ [""]
+    forallSummary l = case lemmaForall l of
+      []  -> ""
+      fas -> "  (forall "
+               ++ commaJoin [n ++ " : " ++ tn | (n, TyCon tn) <- fas]
+               ++ ")"
 
 showSLLProgramFull :: Program -> String
 showSLLProgramFull (Program fs gs) =
@@ -260,20 +285,23 @@ safeRead s = case reads s of
 
 -- Ask the LLM for one candidate lemma. Increments the supplied call
 -- counter (for stats); doesn't enforce a budget — distillTask's loop
--- bounds the number of attempts.
+-- bounds the number of attempts. The `context` is the list of
+-- previously-verified lemmas, surfaced in the prompt as available
+-- rewrite rules so the LLM can decompose hard proofs into chains.
 proposeLemma
   :: IORef Int           -- LLM call counter (for stats / accounting)
   -> TypeEnv
   -> Program
+  -> [Lemma]             -- previously-verified lemmas
   -> Expr
   -> Name                -- name to assign to the proposed lemma
   -> IO (Maybe Lemma)
-proposeLemma counter env prog e name = do
+proposeLemma counter env prog context e name = do
   modifyIORef' counter (+1)
   k <- readIORef counter
   hPutStrLn stderr $ "  [distill] requesting lemma #" ++ show k
                        ++ " for: " ++ showSLL e
-  result <- try (chat (buildLemmaPrompt env prog e))
+  result <- try (chat (buildLemmaPrompt env prog context e))
               :: IO (Either SomeException String)
   case result of
     Left err -> do
@@ -290,9 +318,11 @@ proposeLemma counter env prog e name = do
             ++ showSLL (lemmaLhs lem) ++ " = " ++ showSLL (lemmaRhs lem)
           return (Just lem)
 
-verifyLemma :: TypeEnv -> Program -> Lemma -> LeanProject -> IO Bool
-verifyLemma env prog lem proj = do
-  v <- verify proj (embedLemma env prog lem)
+-- Verify a candidate lemma. The Conjecture file inlines all
+-- previously-verified lemmas so the new proof can reference them.
+verifyLemma :: TypeEnv -> Program -> [Lemma] -> Lemma -> LeanProject -> IO Bool
+verifyLemma env prog context lem proj = do
+  v <- verify proj (embedLemma env prog context lem)
   case v of
     Ok -> do
       hPutStrLn stderr "  [distill] lemma verified by Lean"
@@ -306,6 +336,12 @@ verifyLemma env prog lem proj = do
 -- =========================================================================
 
 -- Iteratively propose / verify / rewrite, up to `budget` proposals.
+-- Verified lemmas accumulate in a context list that is shown to the
+-- LLM in subsequent prompts (so proofs can chain) and inlined into
+-- subsequent Conjecture files (so Lean recognizes them as rewrite
+-- rules). We keep verified lemmas in the chain even when their LHS
+-- doesn't pattern-match the current expression — they may help prove
+-- a later lemma.
 distillTask
   :: IORef Int           -- LLM call counter (for stats)
   -> Int                 -- per-distillation budget (max proposals)
@@ -314,23 +350,28 @@ distillTask
   -> LeanProject
   -> Expr                -- input expression
   -> IO Expr             -- distilled expression (may equal input)
-distillTask counter budget env prog proj = go 1
+distillTask counter budget env prog proj = go 1 []
   where
-    go i e | i > budget = return e
-    go i e = do
+    go i ctx e | i > budget = return e
+    go i ctx e = do
       let lemName = "lemma_" ++ show i
-      mLem <- proposeLemma counter env prog e lemName
+      mLem <- proposeLemma counter env prog ctx e lemName
       case mLem of
         Nothing  -> return e        -- LLM declined or parse failed; stop
         Just lem -> do
-          ok <- verifyLemma env prog lem proj
+          ok <- verifyLemma env prog ctx lem proj
           if not ok
-            then go (i + 1) e         -- bad proof; try another
-            else case rewriteWith lem e of
-              Nothing -> do
-                hPutStrLn stderr "  [distill] lemma verified but doesn't match e"
-                go (i + 1) e
-              Just e' -> do
-                hPutStrLn stderr $ "  [distill] applied: " ++ showSLL e'
-                go (i + 1) e'
+            then go (i + 1) ctx e   -- bad proof; try another
+            else
+              -- verified — accumulate in context regardless of whether
+              -- it rewrites the current expression
+              let ctx' = ctx ++ [lem]
+              in case rewriteWith lem e of
+                   Nothing -> do
+                     hPutStrLn stderr
+                       "  [distill] lemma verified, kept in context (no match for e)"
+                     go (i + 1) ctx' e
+                   Just e' -> do
+                     hPutStrLn stderr $ "  [distill] applied: " ++ showSLL e'
+                     go (i + 1) ctx' e'
 

@@ -234,14 +234,21 @@ pre-pass (see `src/Distillation.hs` and the "Distillation" section of
 
 1. Ask the LLM for a candidate lemma about the program + input
    expression. The lemma is `forall <vars>, lhs = rhs` plus a Lean
-   proof body.
-2. Render the lemma as a Lean theorem (via `embedLemma`) and verify
-   via the existing `LeanCheck.verify`. Lemmas usually need induction,
-   so the LLM-supplied proof body is what gets checked — this is
-   where the LLM-as-prover stage 2 finally does substantive work.
-3. If verified, pattern-match the lemma's LHS against subexpressions
+   proof body. Previously-verified lemmas in this run are listed in
+   the prompt as available rewrite rules (`rw [lemma_n]` /
+   `simp [lemma_n]`), so the LLM can decompose hard proofs into
+   chains.
+2. Render the lemma as a Lean theorem (via `embedLemma`) along with
+   all previously-verified lemmas (re-stated with their original
+   proofs) and verify via `LeanCheck.verify`. Lemmas usually need
+   induction, so the LLM-supplied proof body is what gets checked —
+   this is where the LLM-as-prover stage 2 finally does substantive
+   work.
+3. If verified, the lemma is added to the chain (passed forward to
+   subsequent iterations) AND pattern-matched against subexpressions
    of the input (one-sided unifier; lemma's bound vars are
-   metavariables) and rewrite to RHS.
+   metavariables). On a match, the input is rewritten to the lemma's
+   RHS.
 4. Repeat up to `maxDistillLemmas = 3` LLM calls per supercompile.
 
 A typical successful trace:
@@ -261,11 +268,20 @@ by induction n with | Z => rfl | S x ih => simp [gDouble, gHalf, gHalf1]; exact 
 ```
 
 Failure modes (all graceful — fall through to driving the original
-expression):
+expression with whatever lemmas the chain accumulated):
 - `lemma rejected: <lean error>` — Lean refused the proof
 - `parse failed (or NONE)` — LLM declined or sent malformed output
-- `lemma verified but doesn't match e` — proof was good but the LHS
-  doesn't appear in the input expression
+- `lemma verified, kept in context (no match for e)` — proof was
+  good but the LHS doesn't appear in the input expression. The
+  lemma stays in the chain for subsequent iterations to use.
+
+The proof step is currently the most non-deterministic part of the
+pipeline: the same lemma target may produce different proof attempts
+across runs (e.g. `simp` vs `simp only`), with different outcomes.
+The system handles this by trying alternatives within the budget; a
+proof-retry loop (re-prompt with the Lean error, ask for a fix to
+the same lemma) is the next-most-leverage improvement and is on the
+PLAN.md "Not yet" list.
 
 ## Benchmarks
 
