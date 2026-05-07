@@ -1,7 +1,8 @@
 # Minimal Supercompiler
 
-This is a minimal supercompiler (`sc-mini`).
-The goal is to stress the main features of supercompilation for a working functional programmer.
+This is a minimal supercompiler (`sc-mini`), [augmented here with sound LLM rewrites](README_LLM.md).
+
+Originally, the goal is to stress the main features of supercompilation for a working functional programmer.
 Its design is an attempt to illustrate the following formula:
 
     Supercompiler = Driving
