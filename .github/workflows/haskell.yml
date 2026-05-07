@@ -76,8 +76,14 @@ jobs:
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       # Pre-fetch the toolchain pinned in src/LeanCheck.hs (leanToolchain).
-      # No-op on cache hit; surfaces a clear failure if the pin moves.
+      # `elan toolchain install` exits non-zero when already installed
+      # (cache hit), so probe with `list` first.
       - name: Pre-fetch Lean toolchain
-        run: ~/.elan/bin/elan toolchain install leanprover/lean4:v4.29.1
+        run: |
+          if ~/.elan/bin/elan toolchain list | grep -qF 'leanprover/lean4:v4.29.1'; then
+            echo "leanprover/lean4:v4.29.1 already installed (cache hit)"
+          else
+            ~/.elan/bin/elan toolchain install leanprover/lean4:v4.29.1
+          fi
 
       - run: stack test sc-mini:lean-roundtrip
