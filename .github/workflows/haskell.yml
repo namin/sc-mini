@@ -1,14 +1,82 @@
-on: [push]
-name: build
+name: ci
+
+on:
+  push:
+    branches: [llm, master]
+  pull_request:
+
 jobs:
-  runhaskell:
+  haskell-build:
     name: stack build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-haskell@v1.1.4
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
         with:
-          ghc-version: '8.8.4'
           enable-stack: true
-          stack-version: '2.5.1'
-      - run: stack --system-ghc build
+          stack-no-global: true
+          stack-setup-ghc: true
+
+      - name: Cache stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.stack-root }}
+            .stack-work
+          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock') }}-${{ hashFiles('sc-mini.cabal') }}
+          restore-keys: |
+            stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock') }}-
+            stack-${{ runner.os }}-
+
+      - run: stack build --no-run-tests --test
+
+  lean-roundtrip:
+    name: lean roundtrip
+    runs-on: ubuntu-latest
+    needs: haskell-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: haskell-actions/setup@v2
+        id: setup
+        with:
+          enable-stack: true
+          stack-no-global: true
+          stack-setup-ghc: true
+
+      - name: Cache stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.setup.outputs.stack-root }}
+            .stack-work
+          key: stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock') }}-${{ hashFiles('sc-mini.cabal') }}
+          restore-keys: |
+            stack-${{ runner.os }}-${{ hashFiles('stack.yaml.lock') }}-
+            stack-${{ runner.os }}-
+
+      # LeanCheck.hs hardcodes $HOME/.elan/bin/lake, so elan must live there.
+      # Cache restore happens at this step; install/toolchain steps are
+      # idempotent, so a cache hit makes them no-ops.
+      - name: Cache elan + toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-lean4-v4.29.1
+
+      - name: Install elan (if not cached)
+        run: |
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh \
+              | sh -s -- -y --default-toolchain none
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      # Pre-fetch the toolchain pinned in src/LeanCheck.hs (leanToolchain).
+      # No-op on cache hit; surfaces a clear failure if the pin moves.
+      - name: Pre-fetch Lean toolchain
+        run: ~/.elan/bin/elan toolchain install leanprover/lean4:v4.29.1
+
+      - run: stack test sc-mini:lean-roundtrip
