@@ -48,7 +48,7 @@ lakefileToml = unlines
   , "name = \"Program\""
   ]
 
--- Pinned to match the toolchain noted in DUMP.md. If the user's elan has
+-- Pinned to leanprover/lean4:v4.29.1 (the project's lean-toolchain). If the user's elan has
 -- 4.29.1 already, this avoids any download.
 leanToolchain :: String
 leanToolchain = "leanprover/lean4:v4.29.1\n"
@@ -57,7 +57,7 @@ leanToolchain = "leanprover/lean4:v4.29.1\n"
 -- Binary discovery
 -- =========================================================================
 
--- We assume elan is installed at $HOME/.elan (per DUMP.md). The wrappers
+-- We assume elan is installed at $HOME/.elan. The wrappers
 -- there honor the project's lean-toolchain file automatically.
 elanBin :: String -> IO FilePath
 elanBin name = do
