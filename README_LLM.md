@@ -50,7 +50,7 @@ Modules (all under `src/`):
 |--------------------|----------------|
 | `Types.hs`         | `TypeEnv` (data decls + function signatures) |
 | `LeanEmbed.hs`     | Render `Program` and conjectures to Lean source |
-| `LeanCheck.hs`     | Lake-project lifecycle, `verify` shells out to `lake env lean` |
+| `LeanCheck.hs`     | Lake-project lifecycle, `verify` shells out to `lake env lean` (rejects `sorry`-containing proofs — exit code 0 alone is not a verdict) |
 | `LeanProver.hs`    | The canned auto-prove tactic and `tryAuto` |
 | `LLMSupercompiler.hs` | Whistles, prompt construction, integration with `bftIO` |
 | `Bedrock.hs`       | AWS SigV4 + Bedrock invoke for Claude |
@@ -192,8 +192,8 @@ Sample output (typical run; outcomes have run-to-run variance — see
 
 ```
 ==> even-square
-    sizes: orig=11  classical=328  llm=4
-    12       |    315 |     13 |     13 |    0.04  |    0.04   |   1.00
+    sizes: orig=11  classical=328  llm=22
+    12       |    315 |     13 |    314 |    0.04  |    1.00   |  24.15
 
 ==> add-assoc
     sizes: orig=11  classical=4  llm=4
@@ -271,9 +271,10 @@ and the same prompt, the LLM picks different lemma forms and writes
 different proofs, sometimes succeeding and sometimes hitting Lean
 syntax errors. We've observed:
 
-- `even-square` landing at 4 fns / 13 steps in some runs; 22 fns /
-  314 steps (no distillation help) in others — depending on whether
-  the LLM's chosen proof verifies.
+- `even-square` landing at 22 fns / 314 steps (no distillation help)
+  in every run since the verifier began rejecting `sorry`. The
+  4 fns / 13 steps outcome recorded earlier was observed under the
+  exit-code-only check and has not recurred under the strict gate.
 - `add-commute` consistently chains the right helpers but the
   commutativity proof fails for various reasons each run.
 - The other three benchmarks are stable.
@@ -306,10 +307,11 @@ original program. The empirical picture across 5 benchmarks:
   (`gHalf(gDouble(n)) = n` then `gEq(n, n) = True`) reduce the input
   to a constant. **Beats classical strictly** — 0 fns / 0 steps vs.
   2 fns / 13 steps at n=12.
-- `even-square` (when the LLM's proof verifies) lands at 4 fns / 13
-  steps — same speed as classical, **82x smaller residual**. Has
-  run-to-run variance; sometimes the LLM's proof attempt fails and
-  the residual drops to no-distillation level.
+- `even-square`: the parity lemma (`gEven(gMult(x, x)) = gEven(x)`)
+  has not survived the `sorry`-rejecting verifier in recent runs, so
+  the path falls back to whistle-time generalizations — 22 fns / 314
+  steps: 15x smaller than classical's 328-function residual, but
+  without its speedup.
 - `add-assoc` ties classical (4 fns / 22 steps) via associativity.
 - `kmp-aa` doesn't unlock — structurally out of scope (only one
   call subexpression in the input; no useful semantic lemma at the

@@ -14,6 +14,7 @@ import LeanEmbed (embedProgram)
 
 import Control.Exception (catch, SomeException)
 import Data.IORef
+import Data.List (isInfixOf)
 import System.Directory
 import System.Environment (getEnv)
 import System.Exit
@@ -108,6 +109,11 @@ teardownProject proj = do
 -- Write Conjecture_<n>.lean and run `lake env lean` against it.
 -- `lake env` sets LEAN_PATH so `import Program` resolves to the .olean
 -- built by setupProject.
+--
+-- A proof containing `sorry` compiles with exit code 0 (Lean emits only
+-- a warning), so ExitSuccess alone is not proof. Reject any run whose
+-- diagnostics mention sorry — otherwise an LLM proof with a sorry'd
+-- case is admitted as "verified".
 verify :: LeanProject -> String -> IO Verdict
 verify proj conjectureSrc = do
   n <- atomicModifyIORef' (projCounter proj) (\i -> let i' = i + 1 in (i', i'))
@@ -116,6 +122,10 @@ verify proj conjectureSrc = do
   lake <- elanBin "lake"
   (exitCode, out, err) <- readCreateProcessWithExitCode
     (proc lake ["env", "lean", fname]) { cwd = Just (projDir proj) } ""
+  let diagnostics = out ++ err
   return $ case exitCode of
-    ExitSuccess   -> Ok
-    ExitFailure _ -> Failed (out ++ err)
+    ExitSuccess
+      | "declaration uses `sorry`" `isInfixOf` diagnostics
+          -> Failed ("proof uses sorry\n" ++ diagnostics)
+      | otherwise -> Ok
+    ExitFailure _ -> Failed diagnostics

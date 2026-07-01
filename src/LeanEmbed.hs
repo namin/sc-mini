@@ -17,9 +17,14 @@ import Data.Graph (SCC(..))
 -- =========================================================================
 
 -- Lean type name. We append a prime to dodge clashes with Lean's stdlib
--- (Nat, Bool, List, ...). The prime is purely cosmetic.
+-- (Nat, Bool, List, ...). The prime is purely cosmetic. Idempotent:
+-- LLM-supplied forall binders sometimes arrive already primed (the
+-- prompts show the Lean embedding), and double-priming makes every
+-- such lemma statement ill-typed.
 renderType :: Type -> String
-renderType (TyCon n) = n ++ "'"
+renderType (TyCon n)
+  | not (null n) && last n == '\'' = n
+  | otherwise                      = n ++ "'"
 
 -- inductive Foo' where
 --   | C1 : Foo'

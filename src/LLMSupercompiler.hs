@@ -44,7 +44,7 @@ maxDistillLemmas = 3
 -- Per-lemma budget for proof-fix retries when Lean rejects an
 -- LLM-supplied proof. Each retry is one additional Bedrock call.
 distillProofRetries :: Int
-distillProofRetries = 1
+distillProofRetries = 3
 
 -- A Whistle decides what to do when the homeomorphic-embedding check
 -- fires: given (ancestor, freshName, current, nameSupply), produce the

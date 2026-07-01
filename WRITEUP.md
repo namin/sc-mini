@@ -32,12 +32,16 @@ Now run the same input through our LLM-augmented pipeline:
 
 ```
 ==> even-square
-    sizes: orig=11  classical=328  llm=4
-    n=12: orig 315 steps  classical 13  llm 13
+    sizes: orig=11  classical=328  llm=22
+    n=12: orig 315 steps  classical 13  llm 314
 ```
 
-**Four functions instead of 328**, at the same step count. Two orders
-of magnitude smaller residual, on the literature's documented worst case.
+**Twenty-two functions instead of 328** — an order of magnitude
+smaller residual on the literature's documented worst case — though
+without classical's speedup: the parity lemma that would collapse the
+computation (`gEven(gMult(x, x)) = gEven(x)`) has so far not survived
+the `sorry`-rejecting verifier, so the size win comes from verified
+whistle-time generalizations alone.
 
 This isn't an isolated win. On `gEq(gHalf(gDouble(n)), n)` — a
 specification ("half-of-double is the identity, so this equality is
@@ -79,8 +83,8 @@ Five layered mechanisms compose:
    context, inlined into subsequent Lean files so later proofs can use
    them as `rw [...]` rules. The LLM can decompose hard lemmas.
 3. **Proof retry.** When Lean rejects an LLM proof, re-prompt with the
-   error and ask for a fix to the same lemma. (One retry per lemma; this
-   is what unlocks `half-of-double`'s second-stage proof.)
+   error and ask for a fix to the same lemma. (Three retries per lemma;
+   this is what unlocks `half-of-double`'s second-stage proof.)
 4. **Rejects tracking with conditional guidance.** Rejected proposals
    accumulate alongside verified ones and appear in subsequent prompts
    so the LLM doesn't re-propose broken lemmas. The prompt softens —
@@ -91,10 +95,14 @@ Five layered mechanisms compose:
    absorbs the LLM's choice between equivalent lemma forms.
 
 The whole extension is about 1200 lines of Haskell. The TCB consists
-of Lean's kernel, the SLL→Lean embedding, the rewriter, and sc-mini's
-underlying engine — none of which the LLM is part of. Anything the
-LLM produces is filtered by the kernel; rejected proposals are
-silently dropped.
+of Lean's kernel, the SLL→Lean embedding, the acceptance check, the
+rewriter, and sc-mini's underlying engine — none of which the LLM is
+part of. Anything the LLM produces is filtered by the kernel; rejected
+proposals are silently dropped. Acceptance means a clean, `sorry`-free
+compile: Lean exits 0 on a proof containing `sorry` (it is only a
+warning), so the acceptance check also scans the diagnostics — the
+exit code alone is not a verdict. (An earlier version of the harness
+trusted the exit code; the numbers below postdate the fix.)
 
 ## A concrete trace: half-of-double
 
@@ -255,12 +263,17 @@ benchmarks; cost is a few cents and a minute or two of wall time.
 Prerequisites: GHC 9.4.8 + stack, Lean 4.29.1 via elan, AWS credentials
 with Bedrock access for the Sonnet 4.6 model.
 
+The landing position is sensitive to two harness knobs: the lemma and
+retry prompts include the Lean embedding of the program (so the model
+writes proofs against the exact primed Lean names), and the proof-retry
+budget is three Bedrock calls per lemma.
+
 Empirical landing position (typical run; outcomes have run-to-run
 variance because the LLM is non-deterministic):
 
 | Benchmark           | Classical  | LLM (this work)              |
 |---------------------|------------|------------------------------|
-| even-square         | 328 / 13   | **4 / 13**  (matches speed, 82× smaller) |
+| even-square         | 328 / 13   | 22 / 314  (15× smaller; no speed win — parity lemma unproved) |
 | add-assoc           | 4 / 22     | 4 / 22  (ties)               |
 | half-of-double      | 2 / 13     | **0 / 0**  (beats classical) |
 | reverse-involution  | 48 / 42    | **0 / 0**  (beats classical) |

@@ -27,7 +27,7 @@ import DataIO (showSLL)
 import DataUtil ((//))
 import Types
 import Bedrock (chat)
-import LeanEmbed (embedLemma)
+import LeanEmbed (embedLemma, embedProgram)
 import LeanCheck (LeanProject, Verdict(..), verify)
 
 import Control.Exception (try, SomeException)
@@ -180,6 +180,12 @@ buildLemmaPrompt env prog context rejects e = unlines $
   , ""
   , "Function signatures:"
   , showFunSigs (funSigs env)
+  , ""
+  , "Lean embedding your proof is checked against (type names carry a"
+  , "trailing prime and constructors are namespaced — e.g. LNat'.Nil,"
+  , "LNat'.Cons — so any `have`/`show`/type ascription inside your proof"
+  , "must use THESE names, never SLL syntax like Nil()):"
+  , embedProgram env prog
   , ""
   ] ++ contextSection ++ rejectsSection ++
   [ "Expression we will supercompile:"
@@ -515,6 +521,12 @@ buildRetryPrompt env prog context lem err = unlines $
   , ""
   , "Program (for reference):"
   , showSLLProgramFull prog
+  , ""
+  , "Lean embedding your proof is checked against (type names carry a"
+  , "trailing prime and constructors are namespaced — e.g. LNat'.Nil,"
+  , "LNat'.Cons — so any `have`/`show`/type ascription inside your proof"
+  , "must use THESE names, never SLL syntax like Nil()):"
+  , embedProgram env prog
   , ""
   ] ++ contextSection ++
   [ "Lemma to prove:"
